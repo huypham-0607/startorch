@@ -399,6 +399,10 @@ The current experiment only measures total RSS of entire process. It doesn't exp
 
 As explained in **3. Retrieval Design & Implementation**, intuitively, a title match should provide more descriptive value than a keyword or a topic match. We are also well aware of this and is working on a model that better encapsulate this relationship.
 
+### 5) Reproducibility
+
+Current state of project is designed to work on current experimental setup first, which is to say, "it works on my machine". Part of the implementation either only works with specific compilers (\_\_FILE_NAME\_\_)
+
 ## 10. Conclusions and future work
 
 In this report, we've outlined out architectural design for our High Recall IR system for OpenAlex Works entities. We've also benchmarked rank-safety, retrieval effectiveness, and performance gain compared to exhaustive search. While rank-safety is still pending for a resolution, both retrieval effectiveness and performance gain is promising compared to our original full search proposal at 345M documents scale.
@@ -409,8 +413,7 @@ Along with that, we will starts incoperating our PageRank implementation for Sta
 
 ## References
 
-- **WAND (Weak AND)** — Broder, Carmel, Herscovici, Soffer, Zien, [*"Efficient Query Evaluation using a
-  Two-Level Retrieval Process"*](https://www.researchgate.net/publication/221613425_Efficient_query_evaluation_using_a_two-level_retrieval_process)
+- **WAND (Weak AND)** — Broder, Carmel, Herscovici, Soffer, Zien, [*"Efficient Query Evaluation using a Two-Level Retrieval Process"*](https://www.researchgate.net/publication/221613425_Efficient_query_evaluation_using_a_two-level_retrieval_process)
   (CIKM 2003).
 
 - **Block-Max WAND (BMW)** — Ding & Suel, [*"Faster Top-k Document Retrieval Using Block-Max Indexes"*](https://research.engineering.nyu.edu/~suel/papers/bmw.pdf)
