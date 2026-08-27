@@ -2,15 +2,13 @@
 
 **Startorch** is a literature search engine built around lexical retrieval and citation-graph ranking.
 
-It currently targets the OpenAlex English-only Works corpus: 345M+ papers. The retrieval layer uses BM25 with a custom Block-Max WAND implementation, while the graph side will use Global PageRank and approximate Personalized PageRank to rerank retrieved documents.
+It currently targets the OpenAlex English-only Works corpus: 345M+ papers. The retrieval layer uses BM25 with a custom Block-Max WAND implementation, while the graph side will use Global PageRank to rerank retrieved documents.
 
 The long-term goal is to support sub-second top-k retrieval over the full corpus while using the citation graph as an additional ranking signal, all while keeping RAM usage manageable for a personal device.
 
 ## Why this project?
 
-Startorch is an experiment in using the citation graph more directly for research artifact retrieval.
-
-The main question is whether a combination of:
+Startorch is an experiment aimed to answer the question whether a combination of:
 
 - Lexical relevance,
 - Global graph authority, and
@@ -18,7 +16,7 @@ The main question is whether a combination of:
 
 can produce useful literature recommendations while remaining efficient enough to run over a graph with hundreds of millions of papers.
 
-The project is also an excuse to implement the underlying systems rather than treating retrieval and ranking as black boxes. In particular, the current work focuses on compressed inverted indexes, dynamic pruning, large graph representations, and bounded-memory graph algorithms.
+Admittedly, applications of PageRank in citation graph is not a novel concepts, and many papers in the past have aimed to answer this very question (e.g. CiteRank). The project is therefore more of an excuse to implement the underlying systems rather than treating retrieval and ranking as black boxes. In particular, the current work focuses on cleverly implementing IR pipelines to run under specific time and memory constraints.
 
 ## Status
 
@@ -59,15 +57,13 @@ Planned components are:
 
 - CSR/CSC storage for the citation graph
 - Global PageRank
-- approximate Personalized PageRank using local push
-
-PPR will be seeded from lexical retrieval results but will operate over the full citation graph rather than a graph restricted to the BM25 candidate set.
+- Some kind of query-specific authority (This needs more research into)
 
 ### Development dataset
 
 To avoid iterating against the full 510M-node corpus during development, the repository can build a Mathematics-only OpenAlex subgraph containing roughly 4.7M works and their real citation edges.
 
-This is intended for graph development, correctness testing, and early benchmarks.
+This is intended for correctness testing and exploratory work in general.
 
 ### Python tooling
 
@@ -79,17 +75,16 @@ The CLI currently supports the full retrieval pipeline, including data ingestion
 
 Embedding-based retrieval is currently out of scope.
 
-We originally planned to combine lexical, graph, and embedding-based retrieval, but running all three at OpenAlex scale would make the project considerably larger. For now, the focus is BM25/Block-Max WAND plus graph ranking.
-
-Semantic retrieval may be revisited later.
+Original plan was to combine lexical, graph, and embedding-based retrieval, but running all three at OpenAlex scale would make the project considerably larger (And given the amount of manpower, not really feasible). For now, the focus is BM25/Block-Max WAND plus graph ranking.
 
 ## Next steps
 
 The future plan for this project is:
 
 1. Begin the graph representation and Global PageRank implementation.
-2. Add approximate PPR once the graph infrastructure is stable.
-3. Potentially revisit retrieval design to optimize for performance, particularly in memory usage.
+2. Figure out to aggregate rankings from each metrics.
+3. More research and reading for query-specific authority rankings.
+4. Potentially revisit retrieval design to optimize for performance, particularly in memory usage.
 
 ## Progress
 
@@ -144,8 +139,9 @@ startorch/
 │
 ├── docs/
 │   ├── initialization.md               overall project plan
-│   ├── algorithm_design.md             retrieval/ranking design
+│   ├── algorithm_design.md             retrieval/ranking design (deprecated)
 │   ├── retrieval_engine.md             BM25 + Block-Max WAND implementation
+│   ├── bmw_technical_report.md         Comprehensive BMW implementation technical report + benchmarks.
 │   ├── data_pipeline.md                OpenAlex ingestion pipeline
 │   └── data_reference.md               OpenAlex field reference
 │
