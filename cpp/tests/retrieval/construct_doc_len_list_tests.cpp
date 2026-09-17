@@ -278,6 +278,25 @@ namespace ConstructDocLenListTest {
         ASSERT_EQ(result, expected);
     }
 
+    TEST_F(ConstructDocLenListTest, UnsortedDocIdsProduceSameTableAsSorted) {
+        // Documents arrive out of doc_id order, including across files.
+        // Gap encoding used to underflow here.
+        write_stream("token_0000.bin", { {8, "f"}, {3, "a"}, {3, "b"} });
+        write_stream("token_0001.bin", { {5, "c"}, {5, "d"}, {5, "e"}, {0, "g"} });
+
+        ASSERT_NO_THROW(construct_doc_len_list(in_dir, out_dir));
+
+        auto result = read_doc_len_table();
+        std::vector<std::pair<unsigned long long, unsigned int>> expected = {
+            {0, 1}, {3, 2}, {5, 3}, {8, 1}
+        };
+        ASSERT_EQ(result, expected);
+
+        auto [total_docs, total_frequency] = read_doc_len_meta(out_dir / file_names::DOC_LEN_META);
+        EXPECT_EQ(total_docs, 4u);
+        EXPECT_EQ(total_frequency, 7u);
+    }
+
     TEST_F(ConstructDocLenListTest, EmptyInputProducesEmptyTable) {
         ASSERT_NO_THROW(construct_doc_len_list(in_dir, out_dir));
 

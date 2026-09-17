@@ -1,12 +1,18 @@
 #include "startorch/retrieval/file_names.h"
 #include "startorch/retrieval/merge_inverted_blocks.h"
 #include "startorch/retrieval/construct_doc_len_list.h"
+#include "startorch/retrieval/construct_inverted_blocks.h"
+#include "startorch/retrieval/bm25.h"
 #include "startorch/utils/file_io.h"
 #include "startorch/utils/vbe.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <format>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -179,10 +185,9 @@ namespace MergeInvertedBlocksTest {
     };
 
     TEST_F(MergeInvertedBlocksTest, MergesMultiShardMultiTermCorpus) {
-        // Same 8-doc / 6-term / 3-shard corpus independently cross-checked
-        // against a from-scratch Python reimplementation of the BM25 math
-        // during development (see /data/merge_verify/gen.py). doc lengths:
-        // [3,2,4,1,2,3,1,2] for docs 0..7 -> N=8, avgdl=2.25.
+        // Same 8-doc / 6-term / 3-shard corpus. Bound values below were
+        // recomputed in float32 for IDF = ln((N - df + 0.5) / (df + 0.5) + 1).
+        // doc lengths: [3,2,4,1,2,3,1,2] for docs 0..7 -> N=8, avgdl=2.25.
         write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2},{5,3},{6,1},{7,2}});
 
         write_raw_block_multi(file_names::partial_block_file_name(0), {
@@ -233,10 +238,10 @@ namespace MergeInvertedBlocksTest {
         EXPECT_EQ(tm["alpha"].block_meta_list[0].doc_id, 0);
         EXPECT_EQ(tm["alpha"].block_meta_list[1].doc_id, 2);
         EXPECT_EQ(tm["alpha"].block_meta_list[2].doc_id, 5);
-        EXPECT_NEAR(tm["alpha"].block_meta_list[0].block_ub, 0.301381f, 1e-4);
-        EXPECT_NEAR(tm["alpha"].block_meta_list[1].block_ub, 0.372295f, 1e-4);
-        EXPECT_NEAR(tm["alpha"].block_meta_list[2].block_ub, 0.301381f, 1e-4);
-        EXPECT_NEAR(tm["alpha"].term_ub, 0.372295f, 1e-4);
+        EXPECT_NEAR(tm["alpha"].block_meta_list[0].block_ub, 0.340919f, 1e-4);
+        EXPECT_NEAR(tm["alpha"].block_meta_list[1].block_ub, 0.421135f, 1e-4);
+        EXPECT_NEAR(tm["alpha"].block_meta_list[2].block_ub, 0.340919f, 1e-4);
+        EXPECT_NEAR(tm["alpha"].term_ub, 0.421135f, 1e-4);
 
         EXPECT_EQ(
             read_postings(tm["alpha"].file_index, tm["alpha"].block_meta_list[1].start_addr, 2),
@@ -246,8 +251,8 @@ namespace MergeInvertedBlocksTest {
         // "zeta": singleton, one partial block.
         ASSERT_EQ(tm["zeta"].block_meta_list.size(), 1);
         EXPECT_EQ(tm["zeta"].block_meta_list[0].doc_id, 6);
-        EXPECT_NEAR(tm["zeta"].block_meta_list[0].block_ub, 2.691042f, 1e-3);
-        EXPECT_NEAR(tm["zeta"].term_ub, 2.691042f, 1e-3);
+        EXPECT_NEAR(tm["zeta"].block_meta_list[0].block_ub, 2.318748f, 1e-3);
+        EXPECT_NEAR(tm["zeta"].term_ub, 2.318748f, 1e-3);
         EXPECT_EQ(
             read_postings(tm["zeta"].file_index, tm["zeta"].block_meta_list[0].start_addr, 1),
             (std::vector<std::pair<unsigned long long, unsigned int>>{{6,1}})
@@ -413,18 +418,206 @@ namespace MergeInvertedBlocksTest {
         ASSERT_TRUE(fs::exists(merge_dir / file_names::METADATA_BIN));
 
         fs::path posting_dir, doc_len_dir, doc_len_meta_dir;
-        float k1, b;
+        float k1, b, avgdl;
         int block_size;
         size_t split_size;
-        ASSERT_NO_THROW(read_metadata(merge_dir / file_names::METADATA_BIN, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, block_size, split_size));
+        ASSERT_NO_THROW(read_metadata(merge_dir / file_names::METADATA_BIN, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, avgdl, block_size, split_size));
 
         EXPECT_EQ(posting_dir, merge_dir);
         EXPECT_EQ(doc_len_dir, doc_len_path());
         EXPECT_EQ(doc_len_meta_dir, merge_dir / file_names::DOC_LEN_META);
         EXPECT_EQ(k1, 1.3f);
         EXPECT_EQ(b, 0.6f);
+        EXPECT_EQ(avgdl, 1.0f);  // 2 tokens over 2 documents
         EXPECT_EQ(block_size, 4);
         EXPECT_EQ(split_size, (1ull << 20));
+    }
+
+    TEST_F(MergeInvertedBlocksTest, AvgdlCountsOnlyDocumentsWithTokensAndMatchesBlockBounds) {
+        // Regression test: merge used to divide by doc_len_list.size(),
+        // which also counts doc_id gaps, while the query engine divided by
+        // documents with tokens. A smaller build-time avgdl made block upper
+        // bounds lower than real query-time scores, so pruning could drop
+        // documents. Doc ids 1 and 2 have no tokens here: doc_len_list spans
+        // 4 slots but only 2 documents exist, 6 tokens total.
+        write_doc_len_list({{0,2},{3,4}});
+        write_raw_block(file_names::partial_block_file_name(0), "omega", {{0,1},{3,2}});
+
+        const float k1 = 1.2f, b = 0.75f;
+        auto tm = run_merge(k1, b, /*block_size=*/128);
+
+        fs::path posting_dir, doc_len_dir, doc_len_meta_dir;
+        float read_k1, read_b, avgdl;
+        int block_size;
+        size_t split_size;
+        read_metadata(merge_dir / file_names::METADATA_BIN, posting_dir, doc_len_dir, doc_len_meta_dir, read_k1, read_b, avgdl, block_size, split_size);
+
+        EXPECT_EQ(avgdl, 3.0f) << "avgdl should be 6 tokens / 2 documents, not 6 / doc_len_list.size() = 1.5";
+
+        // Scoring with the stored avgdl must never exceed the stored bounds.
+        const unsigned long long N = 4;  // doc_len_list.size(), as both merge and query use
+        const float doc0 = calc_BM25(N, /*df_t=*/2, /*tf=*/1.0f, /*doc_len=*/2.0f, avgdl, k1, b);
+        const float doc3 = calc_BM25(N, /*df_t=*/2, /*tf=*/2.0f, /*doc_len=*/4.0f, avgdl, k1, b);
+
+        ASSERT_EQ(tm["omega"].block_meta_list.size(), 1);
+        const float block_ub = tm["omega"].block_meta_list[0].block_ub;
+        EXPECT_GE(block_ub, doc0);
+        EXPECT_GE(block_ub, doc3);
+        EXPECT_FLOAT_EQ(block_ub, std::max(doc0, doc3));
+        EXPECT_FLOAT_EQ(tm["omega"].term_ub, std::max(doc0, doc3));
+    }
+
+    // --- load_index / read_term_df_mapping ---
+
+    TEST_F(MergeInvertedBlocksTest, LoadIndexReturnsStoredParametersAndTerms) {
+        write_doc_len_list({{0,1},{1,2},{2,3}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"aaa", {{0,1},{2,1}}},
+            {"bbb", {{1,2},{2,2}}},
+        });
+        merge_inverted_blocks(block_dir, merge_dir, /*k1=*/1.3f, /*b=*/0.6f, /*block_size=*/4, /*split_size=*/(1ull << 20));
+
+        IndexMeta index = load_index(merge_dir / file_names::METADATA_BIN);
+
+        EXPECT_EQ(index.posting_dir, merge_dir);
+        EXPECT_EQ(index.k1, 1.3f);
+        EXPECT_EQ(index.b, 0.6f);
+        EXPECT_EQ(index.avgdl, 2.0f);  // 6 tokens over 3 documents
+        EXPECT_EQ(index.block_size, 4);
+        EXPECT_EQ(index.split_size, (1ull << 20));
+
+        auto expected = read_block_meta_file(merge_dir / file_names::BLOCK_META);
+        ASSERT_EQ(index.terms.size(), expected.size());
+        for (size_t i = 0; i < expected.size(); i++) {
+            EXPECT_EQ(index.terms[i].first, expected[i].first);
+            EXPECT_EQ(index.terms[i].second.doc_count, expected[i].second.doc_count);
+            EXPECT_EQ(index.terms[i].second.block_meta_list.size(), expected[i].second.block_meta_list.size());
+        }
+    }
+
+    TEST_F(MergeInvertedBlocksTest, LoadIndexStillLoadsAfterIndexFolderIsRenamed) {
+        // metadata.bin stores absolute paths from build time. Renaming the
+        // index folder (e.g. full_en -> full-en) makes them stale, so the
+        // loader must resolve files next to metadata.bin instead.
+        write_doc_len_list({{0,1},{1,1}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"aaa", {{0,1}}},
+            {"bbb", {{1,1}}},
+        });
+        run_merge();
+
+        fs::path renamed_dir = tmp_path / "renamed";
+        fs::rename(merge_dir, renamed_dir);
+
+        fs::path stored_posting_dir, stored_doc_len_dir, stored_doc_len_meta_dir;
+        float k1, b, avgdl;
+        int block_size;
+        size_t split_size;
+        read_metadata(renamed_dir / file_names::METADATA_BIN, stored_posting_dir, stored_doc_len_dir, stored_doc_len_meta_dir, k1, b, avgdl, block_size, split_size);
+        ASSERT_EQ(stored_posting_dir, merge_dir) << "precondition: metadata.bin still names the old folder";
+        ASSERT_FALSE(fs::exists(stored_posting_dir / file_names::BLOCK_META));
+
+        IndexMeta index;
+        ASSERT_NO_THROW(index = load_index(renamed_dir / file_names::METADATA_BIN));
+        EXPECT_EQ(index.posting_dir, renamed_dir);
+        EXPECT_EQ(index.terms.size(), 2u);
+    }
+
+    TEST_F(MergeInvertedBlocksTest, ReadTermDfMappingIsSortedByDescendingDf) {
+        write_doc_len_list({{0,1},{1,2},{2,3}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"aaa", {{0,1}}},
+            {"bbb", {{0,1},{1,1},{2,1}}},
+            {"ccc", {{1,1},{2,2}}},
+        });
+        run_merge();
+
+        auto mapping = read_term_df_mapping(merge_dir / file_names::METADATA_BIN);
+
+        std::vector<std::pair<std::string, unsigned int>> expected = {{"bbb", 3}, {"ccc", 2}, {"aaa", 1}};
+        EXPECT_EQ(mapping, expected);
+    }
+
+    // --- Token stream order ---
+
+    TEST_F(MergeInvertedBlocksTest, ShuffledAndSortedDocOrderBuildIdenticalIndexes) {
+        // The tokenizer writes documents in corpus file order, not doc_id
+        // order. The whole build (doc lengths, SPIMI, merge) must give the
+        // same index either way. A tiny SPIMI memory limit splits each token
+        // file into several partial blocks, whose doc_id ranges overlap in
+        // the shuffled build.
+        const unsigned long long doc_count = 40;
+        auto doc_tokens = [](unsigned long long doc) {
+            std::vector<std::string> tokens;
+            if (doc == 13) return tokens;  // no tokens: leaves a doc_id gap
+            for (unsigned long long j = 0; j < 1 + doc % 4; j++) {
+                tokens.push_back(std::format("t{}", (doc * 7 + j) % 5));
+                tokens.push_back(std::format("t{}", (doc + j) % 3));  // repeats give tf > 1
+            }
+            return tokens;
+        };
+
+        auto build = [&](const std::string& name, const std::vector<unsigned long long>& doc_order) {
+            fs::path root = tmp_path / name;
+            fs::path token_dir = root / "tokens", partial_dir = root / "partial", posting_dir = root / "posting";
+            fs::create_directories(token_dir);
+            fs::create_directories(partial_dir);
+            fs::create_directories(posting_dir);
+
+            // Two token files, split halfway through doc_order.
+            const size_t half = doc_order.size() / 2;
+            for (size_t file = 0; file < 2; file++) {
+                SafeFile fp(token_dir / std::format("token_{:04}.bin", file), "wb");
+                for (size_t i = (file == 0 ? 0 : half); i < (file == 0 ? half : doc_order.size()); i++) {
+                    unsigned long long doc = doc_order[i];
+                    for (const auto& term : doc_tokens(doc)) {
+                        unsigned short term_size = term.size();
+                        fwrite(&doc, sizeof(doc), 1, fp.get());
+                        fwrite(&term_size, sizeof(term_size), 1, fp.get());
+                        fwrite(term.c_str(), sizeof(char), term_size, fp.get());
+                    }
+                }
+            }
+
+            construct_doc_len_list(token_dir, posting_dir);
+            construct_inverted_blocks(token_dir, partial_dir, /*mem_limit=*/600);
+            merge_inverted_blocks(partial_dir, posting_dir, 1.2f, 0.75f, /*block_size=*/4, /*split_size=*/64);
+
+            EXPECT_GT(glob_files(partial_dir, "", file_names::PARTIAL_BLOCK_EXT).size(), 2u)
+                << name << ": mem_limit should force several partial blocks";
+            return posting_dir;
+        };
+
+        std::vector<unsigned long long> sorted_order, shuffled_order;
+        for (unsigned long long i = 0; i < doc_count; i++) {
+            sorted_order.push_back(i);
+            shuffled_order.push_back((i * 17) % doc_count);  // a permutation: gcd(17, 40) = 1
+        }
+        fs::path sorted_dir = build("sorted", sorted_order);
+        fs::path shuffled_dir = build("shuffled", shuffled_order);
+
+        auto read_bytes = [](const fs::path& path) {
+            std::ifstream in(path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        };
+
+        std::vector<std::string> files = {file_names::DOC_LEN_LIST, file_names::DOC_LEN_META, file_names::BLOCK_META};
+        std::vector<fs::path> posting_files = glob_files(sorted_dir, "posting_", ".bin");
+        ASSERT_GT(posting_files.size(), 1u) << "split_size should force several posting files";
+        for (const auto& path : posting_files) files.push_back(path.filename().string());
+        ASSERT_EQ(glob_files(shuffled_dir, "posting_", ".bin").size(), posting_files.size());
+
+        for (const auto& file : files) {
+            ASSERT_TRUE(fs::exists(shuffled_dir / file)) << file;
+            EXPECT_TRUE(read_bytes(sorted_dir / file) == read_bytes(shuffled_dir / file))
+                << file << " differs between sorted and shuffled doc order";
+        }
+
+        // metadata.bin stores each build's own folder, so compare parameters.
+        IndexMeta sorted_index = load_index(sorted_dir / file_names::METADATA_BIN);
+        IndexMeta shuffled_index = load_index(shuffled_dir / file_names::METADATA_BIN);
+        EXPECT_EQ(sorted_index.avgdl, shuffled_index.avgdl);
+        EXPECT_EQ(sorted_index.terms.size(), shuffled_index.terms.size());
     }
 }
 
@@ -450,14 +643,14 @@ namespace MetadataTest {
         fs::path doc_len_dir = tmp_path / "doclen";
         fs::path doc_len_meta_dir = tmp_path / "doclenmeta";
 
-        write_metadata(txt_path, posting_dir, doc_len_dir, doc_len_meta_dir, 1.2f, 0.75f, 128, (1ull << 30));
+        write_metadata(txt_path, posting_dir, doc_len_dir, doc_len_meta_dir, 1.2f, 0.75f, 39.72734f, 128, (1ull << 30));
         ASSERT_TRUE(fs::exists(bin_path));
 
         fs::path read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir;
-        float k1, b;
+        float k1, b, avgdl;
         int block_size;
         size_t split_size;
-        read_metadata(bin_path, read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir, k1, b, block_size, split_size);
+        read_metadata(bin_path, read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir, k1, b, avgdl, block_size, split_size);
 
         EXPECT_EQ(read_posting_dir, posting_dir);
         EXPECT_EQ(read_doc_len_dir, doc_len_dir);
@@ -466,6 +659,7 @@ namespace MetadataTest {
         // (see write_metadata's doc comment) - no tolerance needed.
         EXPECT_EQ(k1, 1.2f);
         EXPECT_EQ(b, 0.75f);
+        EXPECT_EQ(avgdl, 39.72734f);
         EXPECT_EQ(block_size, 128);
         EXPECT_EQ(split_size, (1ull << 30));
     }
@@ -483,20 +677,22 @@ namespace MetadataTest {
         fs::path doc_len_meta_dir = tmp_path / "custom_doclenmeta_dir";
         float k1 = 1.69161642f;
         float b = 0.30673251f;
+        float avgdl = 2.71828183f;
 
-        write_metadata(txt_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, 256, 12345678ull);
+        write_metadata(txt_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, avgdl, 256, 12345678ull);
 
         fs::path read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir;
-        float read_k1, read_b;
+        float read_k1, read_b, read_avgdl;
         int block_size;
         size_t split_size;
-        read_metadata(bin_path, read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir, read_k1, read_b, block_size, split_size);
+        read_metadata(bin_path, read_posting_dir, read_doc_len_dir, read_doc_len_meta_dir, read_k1, read_b, read_avgdl, block_size, split_size);
 
         EXPECT_EQ(read_posting_dir, posting_dir);
         EXPECT_EQ(read_doc_len_dir, doc_len_dir);
         EXPECT_EQ(read_doc_len_meta_dir, doc_len_meta_dir);
         EXPECT_EQ(read_k1, k1);
         EXPECT_EQ(read_b, b);
+        EXPECT_EQ(read_avgdl, avgdl);
         EXPECT_EQ(block_size, 256);
         EXPECT_EQ(split_size, 12345678ull);
     }
@@ -504,7 +700,7 @@ namespace MetadataTest {
     TEST_F(MetadataTest, WriteMetadataAlsoWritesHumanReadableTextFile) {
         fs::path txt_path = tmp_path / file_names::METADATA_TXT;
 
-        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 128, (1ull << 30));
+        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 2.5f, 128, (1ull << 30));
         ASSERT_TRUE(fs::exists(txt_path));
 
         SafeFile in(txt_path, "r");
@@ -519,6 +715,7 @@ namespace MetadataTest {
         EXPECT_NE(content.find("doc_len_meta_dir="), std::string::npos);
         EXPECT_NE(content.find("k1="), std::string::npos);
         EXPECT_NE(content.find("b="), std::string::npos);
+        EXPECT_NE(content.find("avgdl="), std::string::npos);
         EXPECT_NE(content.find("block_size="), std::string::npos);
         EXPECT_NE(content.find("split_size="), std::string::npos);
     }
@@ -526,11 +723,11 @@ namespace MetadataTest {
     TEST_F(MetadataTest, ReadThrowsOnMissingFile) {
         fs::path bin_path = tmp_path / "does_not_exist.bin";
         fs::path posting_dir, doc_len_dir, doc_len_meta_dir;
-        float k1, b;
+        float k1, b, avgdl;
         int block_size;
         size_t split_size;
         ASSERT_THROW(
-            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, block_size, split_size),
+            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, avgdl, block_size, split_size),
             std::runtime_error
         );
     }
@@ -538,7 +735,7 @@ namespace MetadataTest {
     TEST_F(MetadataTest, ReadThrowsOnFileTruncatedBeforeTrailingField) {
         fs::path txt_path = tmp_path / file_names::METADATA_TXT;
         fs::path bin_path = tmp_path / file_names::METADATA_BIN;
-        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 128, (1ull << 30));
+        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 2.5f, 128, (1ull << 30));
 
         // Every field up through block_size is intact; split_size (an
         // 8-byte trailing field) is cut short.
@@ -548,11 +745,11 @@ namespace MetadataTest {
         ASSERT_FALSE(ec);
 
         fs::path posting_dir, doc_len_dir, doc_len_meta_dir;
-        float k1, b;
+        float k1, b, avgdl;
         int block_size;
         size_t split_size;
         ASSERT_THROW(
-            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, block_size, split_size),
+            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, avgdl, block_size, split_size),
             std::runtime_error
         );
     }
@@ -560,7 +757,7 @@ namespace MetadataTest {
     TEST_F(MetadataTest, ReadThrowsOnFileTruncatedMidString) {
         fs::path txt_path = tmp_path / file_names::METADATA_TXT;
         fs::path bin_path = tmp_path / file_names::METADATA_BIN;
-        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 128, (1ull << 30));
+        write_metadata(txt_path, tmp_path / "posting", tmp_path / "doclen", tmp_path / "doclenmeta", 1.2f, 0.75f, 2.5f, 128, (1ull << 30));
 
         // 1 byte is shorter than even posting_dir's 2-byte length prefix.
         std::error_code ec;
@@ -568,11 +765,11 @@ namespace MetadataTest {
         ASSERT_FALSE(ec);
 
         fs::path posting_dir, doc_len_dir, doc_len_meta_dir;
-        float k1, b;
+        float k1, b, avgdl;
         int block_size;
         size_t split_size;
         ASSERT_THROW(
-            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, block_size, split_size),
+            read_metadata(bin_path, posting_dir, doc_len_dir, doc_len_meta_dir, k1, b, avgdl, block_size, split_size),
             std::runtime_error
         );
     }

@@ -3,8 +3,16 @@
 
 #include "startorch/retrieval/merge_inverted_blocks.h"
 #include "startorch/utils/file_io.h"
+#include "startorch/utils/logger.h"
 
+#include <chrono>
+#include <format>
+#include <functional>
 #include <limits>
+#include <queue>
+#include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -47,6 +55,7 @@ private:
     int doc_pos;
 
     size_t read_posting_entry(unsigned long long &delta, unsigned int &freq) const;
+    int find_block(const unsigned long long target_doc_id) const;
 };
 
 void sort_posting(std::vector<PostingPointer>& postings);
@@ -70,51 +79,103 @@ void advance_prefix(
     const unsigned long long target_doc_id
 );
 
-void advance_one_excluding(
+/**
+ * @brief Advance one cursor to target_doc_id: among the sorted prefix whose
+ * doc id satisfies cmp(doc_id, pivot doc), the one with the smallest df
+ * (highest IDF). The only difference between call sites is cmp:
+ * std::less<>{} considers cursors strictly before the pivot doc,
+ * std::less_equal<>{} also includes the pivot doc's tied run.
+ */
+template <typename Compare>
+void advance_one(
     std::vector<PostingPointer>& postings,
     const int pivot,
     const unsigned long long N,
-    const unsigned long long target_doc_id
-);
+    const unsigned long long target_doc_id,
+    Compare cmp
+) {
+    unsigned long long doc = postings[pivot].get_doc_id();
+
+    unsigned int min_df = N+1;
+    int advance_id = -1;
+
+    int idx = 0;
+    while (idx < static_cast<int>(postings.size()) && cmp(postings[idx].get_doc_id(), doc)) {
+
+        const unsigned int df = postings[idx].get_doc_count();
+        if (df < min_df) {
+            min_df = df;
+            advance_id = idx;
+        }
+
+        ++idx;
+    }
+    if (advance_id == -1) {
+        throw std::runtime_error(std::format(
+            "Unable to find advancing index for pivot doc_id {}.",
+            doc
+        ));
+    }
+    postings[advance_id].next(target_doc_id);
+}
 
 unsigned long long get_new_candidate(
     std::vector<PostingPointer>& postings,
     const int pivot
 );
 
-void advance_one_including(
-    std::vector<PostingPointer>& postings,
-    const int pivot,
-    const unsigned long long N,
-    const unsigned long long target_doc_id
-);
+// Best-first (score, doc_id) pairs.
+using QueryResult = std::vector<std::pair<float, unsigned long long>>;
+using QueryElapsed = std::chrono::duration<double, std::milli>;
 
-std::pair<std::vector<std::pair<float, unsigned long long>>, std::chrono::duration<double, std::milli>> query (
-    const fs::path meta_path,
-    const std::vector<std::string> raw_terms,
-    const int k
-);
+/**
+ * @brief An opened index that answers many queries.
+ *
+ * The constructor does the whole index load once (metadata and block
+ * metadata via load_index, doc lengths, posting-file mmaps). Callers keep one
+ * engine and call query()/query_exhaustive() repeatedly; each call returns its
+ * results and the time spent searching, which excludes the index load.
+ */
+class QueryEngine {
+public:
+    explicit QueryEngine(const fs::path& meta_path);
 
-std::vector<std::vector<std::pair<float, unsigned long long>>> query_batch(
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
-);
+    // Block-Max WAND top-k.
+    std::pair<QueryResult, QueryElapsed> query(
+        const std::vector<std::string>& raw_terms,
+        const int k
+    );
 
-std::pair<std::vector<std::vector<std::pair<float, unsigned long long>>>,
-        std::pair<std::chrono::duration<double, std::milli>, std::vector<std::chrono::duration<double, std::milli>>>>
-        query_batch_benchmark(
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
-);
+    // Scores every candidate with no pruning. Ground truth for query(): the
+    // results must match exactly, only the time differs.
+    std::pair<QueryResult, QueryElapsed> query_exhaustive(
+        const std::vector<std::string>& raw_terms,
+        const int k
+    );
 
-std::pair<std::vector<std::vector<std::pair<float, unsigned long long>>>,
-        std::pair<std::chrono::duration<double, std::milli>, std::vector<std::chrono::duration<double, std::milli>>>>
-        query_batch_exhaustive_benchmark(
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
-);
+private:
+    using TopK = std::priority_queue<
+        std::pair<float, unsigned long long>,
+        std::vector<std::pair<float, unsigned long long>>,
+        std::greater<std::pair<float, unsigned long long>>
+    >;
+
+    QueryResult search(const std::vector<std::string>& raw_terms, const int k);
+    QueryResult search_exhaustive(const std::vector<std::string>& raw_terms, const int k);
+
+    std::vector<PostingPointer> open_postings(const std::vector<std::string>& raw_terms);
+    static TopK make_top_k(const int k);
+    static QueryResult drain_top_k(TopK& top_k);
+
+    Logger logger;
+    fs::path in_path;
+    float k1, b;
+    int block_size;
+    size_t split_size;
+    std::vector<unsigned int> doc_len_list;
+    float avgdl;
+    std::unordered_map<std::string, TermMeta> term_meta_mapping;
+    std::unordered_map<unsigned int, SafeFileMmap> file_index_mapping;
+};
 
 #endif

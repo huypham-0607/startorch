@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <gtest/gtest.h>
 #include <stdexcept>
 #include <string>
@@ -460,7 +461,7 @@ namespace QueryHelpersTest {
         //   block0: [(2,f=1)]          block_ub=0.6
         //
         // t1/t2/t3 have distinct doc_counts (3,2,1) so IDF-based tie-breaks
-        // in advance_one_excluding/advance_one_including are unambiguous,
+        // in advance_one (with std::less or std::less_equal) are unambiguous,
         // and distinct term_ub (1.0/0.8/0.6) so a posting's identity can be
         // recovered after sort_posting() reorders the vector.
         std::vector<unsigned int> doc_len_list = {2,3,2,4,2};
@@ -592,21 +593,21 @@ namespace QueryHelpersTest {
         ASSERT_THROW(advance_prefix(postings, 1, 5), std::runtime_error);
     }
 
-    TEST_F(QueryHelpersTest, AdvanceOneExcludingPicksHighestIdfAmongStrictlyEarlierEntries) {
+    TEST_F(QueryHelpersTest, AdvanceOneWithLessPicksHighestIdfAmongStrictlyEarlierEntries) {
         setupCorpus();
         auto postings = makeSortedPostings();
         int t1 = indexOf(postings, 1.0f), t2 = indexOf(postings, 0.8f), t3 = indexOf(postings, 0.6f);
 
         // pivot=2 (t3, doc=2). Strictly-before-2 candidates: t1(df_t=3), t2(df_t=2).
         // Lower df_t -> higher IDF -> t2 is picked.
-        advance_one_excluding(postings, 2, doc_len_list.size(), 2);
+        advance_one(postings, 2, doc_len_list.size(), 2, std::less<>{});
 
         EXPECT_EQ(postings[t1].get_doc_id(), 0u) << "t1 (lower IDF) must be untouched";
         EXPECT_EQ(postings[t2].get_doc_id(), 3u) << "t2 (higher IDF) should have advanced";
-        EXPECT_EQ(postings[t3].get_doc_id(), 2u) << "pivot itself is untouched by 'excluding'";
+        EXPECT_EQ(postings[t3].get_doc_id(), 2u) << "pivot itself is untouched by std::less";
     }
 
-    TEST_F(QueryHelpersTest, AdvanceOneIncludingPicksHighestIdfIncludingPivot) {
+    TEST_F(QueryHelpersTest, AdvanceOneWithLessEqualPicksHighestIdfIncludingPivot) {
         setupCorpus();
         auto postings = makeSortedPostings();
         int t1 = indexOf(postings, 1.0f), t2 = indexOf(postings, 0.8f), t3 = indexOf(postings, 0.6f);
@@ -614,7 +615,7 @@ namespace QueryHelpersTest {
         // pivot=2 (t3, doc=2). Candidates doc<=2: t1(df_t=3), t2(df_t=2),
         // t3(df_t=1). t3 has the lowest df_t -> highest IDF -> picked, and
         // since t3 has only the one posting, advancing it exhausts it.
-        advance_one_including(postings, 2, doc_len_list.size(), 3);
+        advance_one(postings, 2, doc_len_list.size(), 3, std::less_equal<>{});
 
         EXPECT_EQ(postings[t1].get_doc_id(), 0u);
         EXPECT_EQ(postings[t2].get_doc_id(), 0u);
@@ -764,7 +765,7 @@ namespace QueryEndToEndTest {
         // query() reverses the min-heap pop order before returning, so
         // results come back best-first (non-increasing scores).
 
-        auto [res, elapsed] = query(meta_path, {"cat", "dog"}, 2);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"cat", "dog"}, 2);
         ASSERT_EQ(res.size(), 2u);
         // The two best (highest-score) candidates are the last two of `expected`.
         EXPECT_EQ(res[0].second, expected[3].second);
@@ -782,7 +783,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {"cat", "dog", "bird"}, 4);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"cat", "dog", "bird"}, 4);
         ASSERT_GE(res.size(), 2u) << "need at least 2 results for a non-trivial ordering check";
         for (size_t i = 1; i < res.size(); i++) {
             EXPECT_GE(res[i-1].first, res[i].first)
@@ -798,7 +799,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {"bird"}, 1);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"bird"}, 1);
         ASSERT_EQ(res.size(), 1u);
         EXPECT_EQ(res[0].second, 3u);
     }
@@ -810,7 +811,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {"bird"}, 5);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"bird"}, 5);
         ASSERT_EQ(res.size(), 1u) << "must not pad out to k with (-1, MAX_DOC_ID) sentinels";
         EXPECT_EQ(res[0].second, 3u);
     }
@@ -822,7 +823,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {"cat"}, 2);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"cat"}, 2);
         EXPECT_EQ(res.size(), 2u) << "cat matches 3 docs but k=2 must cap the result count";
     }
 
@@ -833,7 +834,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {"nonexistent_term"}, 3);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"nonexistent_term"}, 3);
         EXPECT_TRUE(res.empty());
     }
 
@@ -844,19 +845,19 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [res, elapsed] = query(meta_path, {}, 3);
+        auto [res, elapsed] = QueryEngine(meta_path).query({}, 3);
         EXPECT_TRUE(res.empty());
     }
 
     TEST_F(QueryEndToEndTest, RecallIsCompleteAcrossManyBlockBoundariesWithNoTies) {
         // Regression guard: get_new_candidate previously discarded its own
         // computed value and always returned MAX_DOC_ID, which made
-        // advance_one_including exhaust postings prematurely instead of
+        // advance_one (std::less_equal) exhaust postings prematurely instead of
         // skipping to the real next candidate - silently dropping matching
         // documents from the result set. block_size=1 forces every single
         // posting into its own block, and "x"/"y" never share a doc_id, so
         // this path (check_block_max failing -> get_new_candidate ->
-        // advance_one_including) is exercised repeatedly.
+        // advance_one with std::less_equal) is exercised repeatedly.
         write_doc_len_list({{0,2},{1,2},{2,2},{3,2},{4,2},{5,2}});
         write_raw_block_multi(file_names::partial_block_file_name(0), {
             {"x", {{0,1},{2,1},{4,1}}},
@@ -864,7 +865,7 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index(1.2f, 0.75f, /*block_size=*/1);
 
-        auto [res, elapsed] = query(meta_path, {"x", "y"}, 6);
+        auto [res, elapsed] = QueryEngine(meta_path).query({"x", "y"}, 6);
         ASSERT_EQ(res.size(), 6u) << "every one of the 6 matching documents must be returned";
 
         std::vector<unsigned long long> doc_ids;
@@ -873,7 +874,9 @@ namespace QueryEndToEndTest {
         EXPECT_EQ(doc_ids, (std::vector<unsigned long long>{0,1,2,3,4,5}));
     }
 
-    TEST_F(QueryEndToEndTest, QueryBatchMatchesIndividualQueryResultsInOrder) {
+    // --- One engine, many queries ---
+
+    TEST_F(QueryEndToEndTest, ReusedEngineMatchesFreshEnginesInOrder) {
         write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
         write_raw_block_multi(file_names::partial_block_file_name(0), {
             {"cat",  {{0,1},{2,2},{4,1}}},
@@ -882,67 +885,92 @@ namespace QueryEndToEndTest {
         });
         fs::path meta_path = build_index();
 
-        auto [cat_res, cat_elapsed] = query(meta_path, {"cat"}, 3);
-        auto [dog_res, dog_elapsed] = query(meta_path, {"dog"}, 3);
-        auto [bird_res, bird_elapsed] = query(meta_path, {"bird"}, 3);
+        auto [cat_fresh, cat_fresh_elapsed] = QueryEngine(meta_path).query({"cat"}, 3);
+        auto [dog_fresh, dog_fresh_elapsed] = QueryEngine(meta_path).query({"dog"}, 3);
+        auto [bird_fresh, bird_fresh_elapsed] = QueryEngine(meta_path).query({"bird"}, 3);
 
-        auto batch_res = query_batch(
-            meta_path, {{"cat"}, {"dog"}, {"bird"}}, {3, 3, 3}
-        );
+        QueryEngine engine(meta_path);
+        auto [cat_res, cat_elapsed] = engine.query({"cat"}, 3);
+        auto [dog_res, dog_elapsed] = engine.query({"dog"}, 3);
+        auto [bird_res, bird_elapsed] = engine.query({"bird"}, 3);
 
-        ASSERT_EQ(batch_res.size(), 3u);
-        EXPECT_EQ(batch_res[0], cat_res)
-            << "query_batch result 0 should match an individual query('cat') call";
-        EXPECT_EQ(batch_res[1], dog_res)
-            << "query_batch result 1 should match an individual query('dog') call";
-        EXPECT_EQ(batch_res[2], bird_res)
-            << "query_batch result 2 should match an individual query('bird') call";
+        EXPECT_EQ(cat_res, cat_fresh) << "query 1 on a reused engine should match a fresh engine";
+        EXPECT_EQ(dog_res, dog_fresh) << "query 2 must not see cursor state left by query 1";
+        EXPECT_EQ(bird_res, bird_fresh) << "query 3 must not see cursor state left by queries 1-2";
+        EXPECT_GE(cat_elapsed.count(), 0.0);
+        EXPECT_GE(dog_elapsed.count(), 0.0);
+        EXPECT_GE(bird_elapsed.count(), 0.0);
     }
 
-    TEST_F(QueryEndToEndTest, QueryBatchBenchmarkReturnsOneElapsedEntryPerQuery) {
+    TEST_F(QueryEndToEndTest, ReusedEngineHandlesMixOfMatchingAndNonMatchingQueries) {
+        write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"cat", {{0,1},{2,2},{4,1}}},
+        });
+        fs::path meta_path = build_index();
+
+        QueryEngine engine(meta_path);
+        EXPECT_EQ(engine.query({"cat"}, 3).first.size(), 3u) << "cat matches 3 documents";
+        EXPECT_TRUE(engine.query({"nonexistent_term"}, 3).first.empty()) << "unindexed term must return no results";
+        EXPECT_TRUE(engine.query({}, 3).first.empty()) << "empty query must return no results";
+        EXPECT_EQ(engine.query({"cat"}, 3).first.size(), 3u) << "earlier empty queries must not affect a later one";
+    }
+
+    TEST_F(QueryEndToEndTest, ReusedEngineRespectsPerQueryK) {
+        write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"cat", {{0,1},{2,2},{4,1}}},
+        });
+        fs::path meta_path = build_index();
+
+        QueryEngine engine(meta_path);
+        EXPECT_EQ(engine.query({"cat"}, 1).first.size(), 1u) << "first query's k=1 must cap its own result count";
+        EXPECT_EQ(engine.query({"cat"}, 2).first.size(), 2u) << "second query's k=2 is independent of the first";
+    }
+
+    TEST_F(QueryEndToEndTest, QueryExhaustiveMatchesQuery) {
+        write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2},{5,2},{6,5},{7,1}});
+        write_raw_block_multi(file_names::partial_block_file_name(0), {
+            {"cat",  {{0,1},{2,2},{4,1},{6,3}}},
+            {"dog",  {{1,1},{2,1},{5,2},{7,1}}},
+            {"bird", {{3,1},{6,1}}},
+        });
+        // block_size=1 so pruning actually skips blocks.
+        fs::path meta_path = build_index(1.2f, 0.75f, /*block_size=*/1);
+
+        QueryEngine engine(meta_path);
+        const std::vector<std::vector<std::string>> queries = {
+            {"cat"}, {"cat", "dog"}, {"cat", "dog", "bird"}, {"bird", "nonexistent_term"}, {}
+        };
+        for (const auto& terms : queries) {
+            for (int k : {1, 2, 3, 8}) {
+                auto [pruned, pruned_elapsed] = engine.query(terms, k);
+                auto [exhaustive, exhaustive_elapsed] = engine.query_exhaustive(terms, k);
+                ASSERT_EQ(pruned.size(), exhaustive.size()) << "k=" << k;
+                for (size_t i = 0; i < pruned.size(); i++) {
+                    EXPECT_EQ(pruned[i].second, exhaustive[i].second) << "k=" << k << ", rank " << i;
+                    EXPECT_FLOAT_EQ(pruned[i].first, exhaustive[i].first) << "k=" << k << ", rank " << i;
+                }
+            }
+        }
+    }
+
+    TEST_F(QueryEndToEndTest, EngineLoadsIndexAfterFolderIsRenamed) {
+        // metadata.bin keeps the build-time absolute folder path; the engine
+        // must still open an index whose folder was renamed afterwards.
         write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
         write_raw_block_multi(file_names::partial_block_file_name(0), {
             {"cat", {{0,1},{2,2},{4,1}}},
             {"dog", {{1,1},{2,1}}},
         });
         fs::path meta_path = build_index();
+        auto [before, before_elapsed] = QueryEngine(meta_path).query({"cat", "dog"}, 4);
 
-        auto [batch_res, timing] = query_batch_benchmark(
-            meta_path, {{"cat"}, {"dog"}}, {2, 2}
-        );
-        auto& [index_load_elapsed, query_elapsed] = timing;
-        EXPECT_EQ(query_elapsed.size(), 2u)
-            << "one elapsed duration must be reported per query, not one for the whole batch";
-    }
+        fs::path renamed_dir = tmp_path / "renamed";
+        fs::rename(merge_dir, renamed_dir);
 
-    TEST_F(QueryEndToEndTest, QueryBatchHandlesMixOfMatchingAndNonMatchingQueries) {
-        write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
-        write_raw_block_multi(file_names::partial_block_file_name(0), {
-            {"cat", {{0,1},{2,2},{4,1}}},
-        });
-        fs::path meta_path = build_index();
-
-        auto batch_res = query_batch(
-            meta_path, {{"cat"}, {"nonexistent_term"}, {}}, {3, 3, 3}
-        );
-        ASSERT_EQ(batch_res.size(), 3u);
-        EXPECT_EQ(batch_res[0].size(), 3u) << "cat matches 3 documents";
-        EXPECT_TRUE(batch_res[1].empty()) << "unindexed term must return no results";
-        EXPECT_TRUE(batch_res[2].empty()) << "empty query must return no results";
-    }
-
-    TEST_F(QueryEndToEndTest, QueryBatchRespectsPerQueryK) {
-        write_doc_len_list({{0,3},{1,2},{2,4},{3,1},{4,2}});
-        write_raw_block_multi(file_names::partial_block_file_name(0), {
-            {"cat", {{0,1},{2,2},{4,1}}},
-        });
-        fs::path meta_path = build_index();
-
-        auto batch_res = query_batch(
-            meta_path, {{"cat"}, {"cat"}}, {1, 2}
-        );
-        ASSERT_EQ(batch_res.size(), 2u);
-        EXPECT_EQ(batch_res[0].size(), 1u) << "first query's k=1 must cap its own result count";
-        EXPECT_EQ(batch_res[1].size(), 2u) << "second query's k=2 is independent of the first";
+        auto [after, after_elapsed] = QueryEngine(renamed_dir / file_names::METADATA_BIN).query({"cat", "dog"}, 4);
+        EXPECT_FALSE(after.empty());
+        EXPECT_EQ(after, before);
     }
 }

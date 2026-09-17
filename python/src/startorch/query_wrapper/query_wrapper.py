@@ -19,11 +19,8 @@ def retrieve(
 
     terms = tokenizer.tokenize_query(query_string)
     meta_path = root_path / posting_folder / startorch_cpp.file_names.METADATA_BIN
-    results, elapsed = startorch_cpp.query(
-        meta_path,
-        terms,
-        k
-    )
+    engine = startorch_cpp.QueryEngine(meta_path)
+    results, elapsed = engine.query(terms, k)
 
     lookup_path = root_path / lookup_folder / lookup_file_name
 
@@ -32,6 +29,6 @@ def retrieve(
             f.seek(results[i][1] * 12)
             chunk = f.read(8)
             results[i] = (results[i][0], struct.unpack('<q', chunk)[0])
-    
+
     for score, doc_id in results:
         print(f"{doc_id} {score}")

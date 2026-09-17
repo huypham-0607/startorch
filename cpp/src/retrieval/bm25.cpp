@@ -14,6 +14,18 @@ float bm25_saturation(
     return numerator / denominator;
 }
 
+float bm25_idf(
+    const unsigned long long N,
+    const unsigned long long df_t
+) {
+    // Double precision: N reaches hundreds of millions, past what a float
+    // represents exactly. Converting before subtracting also avoids
+    // unsigned underflow. log1p(x) == ln(x + 1), more accurate for small x.
+    const double n = static_cast<double>(N);
+    const double df = static_cast<double>(df_t);
+    return static_cast<float>(std::log1p((n - df + 0.5) / (df + 0.5)));
+}
+
 float calc_BM25(
     const unsigned long long N,
     const unsigned long long df_t,
@@ -23,6 +35,5 @@ float calc_BM25(
     const float k1,
     const float b
 ) {
-    float idf = std::log((float)N / (float)df_t);
-    return idf * bm25_saturation(k1, b, tf, doc_len, avgdl);
+    return bm25_idf(N, df_t) * bm25_saturation(k1, b, tf, doc_len, avgdl);
 }

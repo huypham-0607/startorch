@@ -9,10 +9,10 @@
  *
  * To remind, Standard BM25 implementation is:
  *
- *  - log(N/df(Term)) * tf(term,doc)(k+1) / tf(term,doc) + k (1-b+b(|d|/avgdl))
+ *  - IDF(Term) * tf(term,doc)(k+1) / tf(term,doc) + k (1-b+b(|d|/avgdl))
  *
  * For WAND scoring function \alpha_{t} * w(t,d)
- * - \alpha_{t} is our IDF (log(N/df(Term)))
+ * - \alpha_{t} is our IDF: ln((N - df(Term) + 0.5) / (df(Term) + 0.5) + 1), see bm25_idf
  * - w(t,d) is tf(term,doc)(k+1) / tf(term,doc) + k (1-b+b(|d|/avgdl)).
  *
  * When querying with BMW, we will load all relevant
@@ -28,7 +28,6 @@
 #include "startorch/utils/logger.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <format>
 #include <queue>
@@ -303,7 +302,7 @@ size_t build_posting_list(
     // fully drained - apply IDF retroactively to every block this term
     // just produced, turning saturation-only block_ub into the full BM25
     // upper bound, and derive term_ub as the max over them.
-    float idf = std::log((float)N / (float)term_meta.doc_count);
+    float idf = bm25_idf(N, term_meta.doc_count);
     float max_full_ub = 0.0f;
     for (BlockMeta& block : term_meta.block_meta_list) {
         block.block_ub *= idf;
@@ -408,6 +407,7 @@ void write_metadata(
     const fs::path& doc_len_meta_dir,
     const float k1,
     const float b,
+    const float avgdl,
     const int block_size,
     const size_t split_size
 ) {
@@ -422,6 +422,7 @@ void write_metadata(
     res = (res || (std::fprintf(txt_file.get(), "doc_len_meta_dir=%s\n", doc_len_meta_dir.string().c_str()) < 0));
     res = (res || (std::fprintf(txt_file.get(), "k1=%f\n", k1) < 0));
     res = (res || (std::fprintf(txt_file.get(), "b=%f\n", b) < 0));
+    res = (res || (std::fprintf(txt_file.get(), "avgdl=%f\n", avgdl) < 0));
     res = (res || (std::fprintf(txt_file.get(), "block_size=%d\n", block_size) < 0));
     res = (res || (std::fprintf(txt_file.get(), "split_size=%zu\n", split_size) < 0));
 
@@ -456,6 +457,7 @@ void write_metadata(
 
     fwrite(&k1, sizeof(k1), 1, bin_file.get());
     fwrite(&b, sizeof(b), 1, bin_file.get());
+    fwrite(&avgdl, sizeof(avgdl), 1, bin_file.get());
     fwrite(&block_size, sizeof(block_size), 1, bin_file.get());
     fwrite(&split_size, sizeof(split_size), 1, bin_file.get());
 }
@@ -467,6 +469,7 @@ void read_metadata(
     fs::path& doc_len_meta_dir,
     float& k1,
     float& b,
+    float& avgdl,
     int& block_size,
     size_t& split_size
 ) {
@@ -493,6 +496,7 @@ void read_metadata(
     // Potentially add validations here.
     in_file.fread(&k1, sizeof(k1), 1);
     in_file.fread(&b, sizeof(b), 1);
+    in_file.fread(&avgdl, sizeof(avgdl), 1);
     in_file.fread(&block_size, sizeof(block_size), 1);
     in_file.fread(&split_size, sizeof(split_size), 1);
 }
@@ -514,14 +518,15 @@ void merge_inverted_blocks(
 
     read_doc_len_list(doc_len_dir, doc_len_list);
 
-    unsigned long long total_doc_length = 0;
-
-    // Assuming doc_ids are mapped to [0,N)
-    for (unsigned long long i = 0; i < doc_len_list.size(); i++) {
-        total_doc_length += doc_len_list[i];
-    }
-
-    float avgdl = (float)total_doc_length/doc_len_list.size();
+    // The single avgdl for this index: total tokens over documents that
+    // produced at least one token. doc_len_list.size() is not used here -
+    // it also counts doc_id gaps (documents with no tokens). Written to
+    // metadata below, so the query engine scores with exactly the value
+    // these block upper bounds were built with.
+    const auto [total_docs, total_frequency] = read_doc_len_meta(doc_len_meta_dir);
+    const float avgdl = static_cast<float>(
+        static_cast<double>(total_frequency) / static_cast<double>(total_docs)
+    );
     unsigned long long N = doc_len_list.size();
 
     std::vector<fs::path> in_paths = glob_files(in_dir, "", file_names::PARTIAL_BLOCK_EXT);
@@ -610,6 +615,7 @@ void merge_inverted_blocks(
         doc_len_meta_dir,
         k1,
         b,
+        avgdl,
         block_size,
         split_size
     );
@@ -617,28 +623,34 @@ void merge_inverted_blocks(
     logger.log("Finished writing metadata.");
 }
 
+IndexMeta load_index(const fs::path& meta_path) {
+    IndexMeta index;
+
+    // Stored paths are consumed but unused - see load_index in the header.
+    fs::path stored_posting_dir, stored_doc_len_path, stored_doc_len_meta_path;
+    read_metadata(
+        meta_path,
+        stored_posting_dir, stored_doc_len_path, stored_doc_len_meta_path,
+        index.k1, index.b, index.avgdl, index.block_size, index.split_size
+    );
+
+    index.posting_dir = meta_path.parent_path();
+    index.terms = read_block_meta_file(index.posting_dir / file_names::BLOCK_META);
+    return index;
+}
+
 std::vector<std::pair<std::string, unsigned int>> read_term_df_mapping (
     const fs::path& meta_path
 ) {
     Logger logger(__FILE_NAME__, Logger::INFO);
-    fs::path in_path, doc_len_path, doc_len_meta_path;
-    float k1, b;
-    int block_size;
-    size_t split_size;
 
     logger.log(std::format("Fetching TermMeta from {}.", meta_path.string()));
-    read_metadata(meta_path, in_path, doc_len_path, doc_len_meta_path, k1, b, block_size, split_size);
+    IndexMeta index = load_index(meta_path);
     logger.log(std::format("Finished fetching TermMeta from {}.", meta_path.string()));
 
-    // Load term_meta_mapping
-    std::vector<std::pair<std::string, TermMeta>> raw_term_meta_mapping;
-    raw_term_meta_mapping = read_block_meta_file(
-        in_path / file_names::BLOCK_META
-    );
-
     std::vector<std::pair<std::string, unsigned int>> results;
-    results.reserve(raw_term_meta_mapping.size());
-    for (const auto& [term, metadata] : raw_term_meta_mapping) {
+    results.reserve(index.terms.size());
+    for (auto& [term, metadata] : index.terms) {
         results.emplace_back(std::move(term), metadata.doc_count);
     }
 

@@ -73,6 +73,10 @@ void write_partial_index(
 
     unsigned char vbe_buffer[8];
     for (std::string term : dictionary) {
+        // The token stream is not in doc_id order, and the gaps below must
+        // not underflow. Sorting can also shrink the list, so do it first.
+        posting_list_mapping[term].sort();
+
         unsigned short term_size = term.size();                                 // 2 bytes
         unsigned int posting_list_size = posting_list_mapping[term].size();     // 4 bytes should be sufficient
 

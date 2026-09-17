@@ -209,7 +209,7 @@ def main():
 
     paths = config["data-path"]
 
-    full_meta_path = Path(paths["posting-path"]) / "full_en" / config["posting"]["posting-folder"] / "metadata.bin"
+    full_meta_path = Path(paths["posting-path"]) / "full-en" / config["posting"]["posting-folder"] / "metadata.bin"
     query_data_dir = Path(benchmark_config["paths"]["data-dir"]) / "full-en"
     query_data_dir.mkdir(parents=True, exist_ok=True)
 

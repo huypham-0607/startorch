@@ -614,6 +614,26 @@ namespace ConstructInvertedBlocksTest {
         ASSERT_GT(blocks.size(), 1);
     }
 
+    TEST_F(ConstructInvertedBlocksTest, UnsortedDocIdsProduceSortedPostingLists) {
+        // Documents arrive out of doc_id order (tokens of each document stay
+        // contiguous). Gap encoding used to underflow here.
+        write_stream("token_0000.bin", {
+            {20, "alpha"}, {20, "beta"}, {20, "alpha"},
+            {10, "alpha"},
+            {30, "beta"},
+            {5, "alpha"}, {5, "beta"}
+        });
+
+        ASSERT_NO_THROW(construct_inverted_blocks(in_dir, out_dir, (size_t)2*(1LL<<20)));
+
+        std::vector<fs::path> blocks = glob_files(out_dir, "", file_names::PARTIAL_BLOCK_EXT);
+        ASSERT_EQ(blocks.size(), 1);
+
+        auto result = read_block(blocks[0]);
+        ASSERT_EQ(result["alpha"], (std::vector<std::pair<unsigned long long, unsigned int>>{{5,1},{10,1},{20,2}}));
+        ASSERT_EQ(result["beta"], (std::vector<std::pair<unsigned long long, unsigned int>>{{5,1},{20,1},{30,1}}));
+    }
+
     TEST_F(ConstructInvertedBlocksTest, EmptyInputDirProducesNoBlocks) {
         ASSERT_NO_THROW(construct_inverted_blocks(in_dir, out_dir, (size_t)2*(1LL<<20)));
 

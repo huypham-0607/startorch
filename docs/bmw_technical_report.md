@@ -379,7 +379,7 @@ Note that low performance on very_common_set might also be attributed to `domain
 
 For k=10, skewed_set speedup (5.52x) is noticeably better than very_common_set speedup (3.38x). Adding a few terms with high IDF value drives up top-k threshold, allowing more effecting pruning. 
 
-## 9. Threats to validity
+## 9. Threats to validity and shortcomings
 
 Admittedly, there are a few issues with our experimental setup, which we will list in this section.
 
@@ -401,7 +401,7 @@ As explained in **3. Retrieval Design & Implementation**, intuitively, a title m
 
 ### 5) Reproducibility
 
-Current state of project is designed to work on current experimental setup first, which is to say, "it works on my machine". Part of the implementation either only works with specific compilers (\_\_FILE_NAME\_\_)
+Current state of project is designed to work on current experimental setup first, which is to say, "it works on my machine". Part of the implementation either only works under specific setup(e.g. GCC for \_\_FILE_NAME\_\_). The steps required for reproduction is also convoluted and not automated. Future work will work on simplifying steps to reproduce results.
 
 ## 10. Conclusions and future work
 

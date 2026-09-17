@@ -3,7 +3,9 @@ import struct
 import duckdb as db
 import tomllib
 import csv
+import time
 
+from datetime import timedelta
 from pathlib import Path
 from startorch import get_logger, load_benchmark_config, load_config, Tokenizer, startorch_cpp, PROJECT_ROOT
 
@@ -21,7 +23,7 @@ def run_queries_perf_metrics(query_path: Path, k: int, cap: int = QUERY_SET_LEN)
     benchmark_config = load_benchmark_config()
     config = load_config()
 
-    posting_dir = Path(config["data-path"]["posting-path"]) / "full_en" / POSTING_FOLDER
+    posting_dir = Path(config["data-path"]["posting-path"]) / "full-en" / POSTING_FOLDER
     meta_path = posting_dir / startorch_cpp.file_names.METADATA_BIN
 
     logger.info(f"Reading queries from {query_path}...")
@@ -37,10 +39,17 @@ def run_queries_perf_metrics(query_path: Path, k: int, cap: int = QUERY_SET_LEN)
     query_list = list(tokenizer.tokenize_query(query) for _, query in queries)
     logger.info(f"Finished tokenizing queries.")
 
-    k_list = list(k for i in range(len(queries)))
+    logger.info(f"Loading index from {meta_path}...")
+    start = time.perf_counter()
+    engine = startorch_cpp.QueryEngine(meta_path)
+    engine_latency = timedelta(seconds=time.perf_counter() - start)
 
     logger.info(f"Passing queries to BMW engine. Running engine...")
-    results, (engine_latency, query_latency) = startorch_cpp.query_batch_benchmark(meta_path, query_list, k_list)
+    results, query_latency = [], []
+    for terms in query_list:
+        result, elapsed = engine.query(terms, k)
+        results.append(result)
+        query_latency.append(elapsed)
     logger.info(f"Engine finished running, returning benchmarked results.")
 
     return results, engine_latency, query_latency
@@ -50,7 +59,7 @@ def run_queries_exhaustive_perf_metrics(query_path: Path, k: int, cap: int = QUE
     benchmark_config = load_benchmark_config()
     config = load_config()
 
-    posting_dir = Path(config["data-path"]["posting-path"]) / "full_en" / POSTING_FOLDER
+    posting_dir = Path(config["data-path"]["posting-path"]) / "full-en" / POSTING_FOLDER
     meta_path = posting_dir / startorch_cpp.file_names.METADATA_BIN
 
     logger.info(f"Reading queries from {query_path}...")
@@ -66,10 +75,17 @@ def run_queries_exhaustive_perf_metrics(query_path: Path, k: int, cap: int = QUE
     query_list = list(tokenizer.tokenize_query(query) for _, query in queries)
     logger.info(f"Finished tokenizing queries.")
 
-    k_list = list(k for i in range (len(queries)))
+    logger.info(f"Loading index from {meta_path}...")
+    start = time.perf_counter()
+    engine = startorch_cpp.QueryEngine(meta_path)
+    engine_latency = timedelta(seconds=time.perf_counter() - start)
 
     logger.info(f"Passing queries to Exhaustive engine. Running engine...")
-    results, (engine_latency, query_latency) = startorch_cpp.query_batch_exhaustive_benchmark(meta_path, query_list, k_list)
+    results, query_latency = [], []
+    for terms in query_list:
+        result, elapsed = engine.query_exhaustive(terms, k)
+        results.append(result)
+        query_latency.append(elapsed)
     logger.info(f"Engine finished running, returning benchmarked results.")
 
     return results, engine_latency, query_latency

@@ -3,7 +3,9 @@ import struct
 import duckdb as db
 import tomllib
 import csv
+import time
 
+from datetime import timedelta
 from pathlib import Path
 from startorch import get_logger, load_benchmark_config, Tokenizer, startorch_cpp, PROJECT_ROOT
 
@@ -169,9 +171,11 @@ def run_queries(query_path: Path) -> tuple:
 
     query_list = list(tokenizer.tokenize_query(query) for _, query in queries)
     pid_list = list(pid for pid, _ in queries)
-    k_list = list(1000 for i in range (len(queries)))
 
-    return pid_list, startorch_cpp.query_batch(meta_path, query_list, k_list)
+    engine = startorch_cpp.QueryEngine(meta_path)
+    results = [engine.query(terms, 1000)[0] for terms in query_list]
+
+    return pid_list, results
 
 def run_queries_perf_metrics(query_path: Path) -> tuple:
     benchmark_config = load_benchmark_config()
@@ -193,10 +197,13 @@ def run_queries_perf_metrics(query_path: Path) -> tuple:
     query_list = list(tokenizer.tokenize_query(query) for _, query in queries)
     logger.info(f"Finished tokenizing queries.")
 
-    k_list = list(1000 for i in range (len(queries)))
+    logger.info(f"Loading index from {meta_path}...")
+    start = time.perf_counter()
+    engine = startorch_cpp.QueryEngine(meta_path)
+    engine_latency = timedelta(seconds=time.perf_counter() - start)
 
     logger.info(f"Passing queries to BMW engine. Running engine...")
-    _, (engine_latency, query_latency) = startorch_cpp.query_batch_benchmark(meta_path, query_list, k_list)
+    query_latency = [engine.query(terms, 1000)[1] for terms in query_list]
     logger.info(f"Engine finished running, returning benchmarked results.")
 
     return engine_latency, query_latency

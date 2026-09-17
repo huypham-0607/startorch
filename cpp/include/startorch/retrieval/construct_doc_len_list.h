@@ -25,6 +25,10 @@ const std::pair<unsigned long long, unsigned long long> read_doc_len_meta(
  * @brief Construct doc_id - doc_len sequence (out_dir/doc_len_list.bin).
  *
  * Format: (doc_id<vbe_encoding>)(doc_len<unsigned int>)
+ *
+ * The token stream may arrive in any doc_id order, as long as each
+ * document's tokens are contiguous. Entries are always written in ascending
+ * doc_id order, skipping doc ids with no tokens.
  */
 void construct_doc_len_list(
     const std::filesystem::path& in_dir,

@@ -26,6 +26,11 @@ void write_partial_index(
  * @brief SPIMI: chunk tokenized input (in_dir/token_*.bin) into partial,
  * per-shard inverted blocks (out_dir/block_*.bin), each built under
  * mem_limit bytes.
+ *
+ * The token stream may arrive in any doc_id order, as long as each
+ * document's tokens are contiguous. Every posting list is sorted by doc_id
+ * when written, and partial blocks may overlap in doc_id range -
+ * merge_inverted_blocks' heap merge handles both.
  */
 void construct_inverted_blocks(
     const std::filesystem::path& in_dir,

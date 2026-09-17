@@ -48,7 +48,7 @@ def run_msmarco_single(filename: str) -> tuple:
 
     logger.info(f"Finished running MS MARCO queries from {query_path}.")
 
-    # query_batch_benchmark returns datetime.timedelta - convert to plain milliseconds
+    # Latencies come back as datetime.timedelta - convert to plain milliseconds
     query_latency_ms = [td.total_seconds() * 1000 for td in query_latency]
     engine_latency_ms = engine_latency.total_seconds() * 1000
 
@@ -76,7 +76,7 @@ def run_full_en_single(
 
     logger.info(f"Finished running full-en queries from {query_path}, k = {k}, engine = {engine}.")
 
-    # query_batch_benchmark returns datetime.timedelta - convert to plain milliseconds
+    # Latencies come back as datetime.timedelta - convert to plain milliseconds
     query_latency_ms = [td.total_seconds() * 1000 for td in query_latency]
     engine_latency_ms = engine_latency.total_seconds() * 1000
 

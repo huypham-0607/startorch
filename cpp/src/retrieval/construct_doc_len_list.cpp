@@ -39,14 +39,12 @@ void construct_doc_len_list(
 
     logger.log("Started constructing document length list.");
 
-    bool has_started = false;
-
-    unsigned long long delta = 0;
-    unsigned long long prev_doc_id = 0;
-    unsigned int running_freq = 0;
-
+    // Token count per doc_id, indexed by doc_id. The token stream is not in
+    // doc_id order, so lengths are counted by id rather than by runs of equal
+    // ids. Mapped doc ids are dense in [0, N), so this is the same N-entry
+    // array merge_inverted_blocks and the query engine load.
+    std::vector<unsigned int> doc_len;
     unsigned long long total_frequency = 0;
-    unsigned long long total_docs = 0;
 
     for (auto &token_stream : token_streams) {
         SafeFile fp(token_stream, "rb");
@@ -54,25 +52,22 @@ void construct_doc_len_list(
         std::string term;
 
         while (read_token(fp, &cur_doc_id, &term)) {
-            ++total_frequency;
-            if (!has_started || cur_doc_id != prev_doc_id) {
-                if (has_started) {
-                    ++total_docs;
-                    write_doc_len_entry(out_fp, delta, running_freq);
-                }
-                has_started = true;
-                delta = cur_doc_id - prev_doc_id;
-                prev_doc_id = cur_doc_id;
-                running_freq = 0;
+            if (cur_doc_id >= doc_len.size()) {
+                doc_len.resize(cur_doc_id + 1, 0);
             }
-            ++running_freq;
+            ++doc_len[cur_doc_id];
+            ++total_frequency;
         }
     }
 
-    // Adding last element.
-    if (has_started) {
+    // Written in doc_id order, skipping ids with no tokens.
+    unsigned long long total_docs = 0;
+    unsigned long long prev_doc_id = 0;
+    for (unsigned long long doc_id = 0; doc_id < doc_len.size(); doc_id++) {
+        if (doc_len[doc_id] == 0) continue;
+        write_doc_len_entry(out_fp, doc_id - prev_doc_id, doc_len[doc_id]);
+        prev_doc_id = doc_id;
         ++total_docs;
-        write_doc_len_entry(out_fp, delta, running_freq);
     }
 
     fs::path out_meta_path = out_dir / file_names::DOC_LEN_META;

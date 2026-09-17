@@ -56,19 +56,45 @@ TEST(BM25SaturationTest, MonotonicDecreasingInDocLength) {
     ASSERT_GT(avg_doc, long_doc);
 }
 
-TEST(CalcBM25Test, ZeroIdfWhenTermInEveryDocument) {
-    // df_t == N means the term carries no discriminative information -
-    // log(N/df_t) = log(1) = 0, so the score must be exactly zero
-    // regardless of tf/doc_len.
+TEST(BM25IdfTest, ExactHandComputedValue) {
+    // N=100, df=50: (100-50+0.5)/(50+0.5) + 1 = 1 + 1 = 2, so IDF = ln(2).
+    ASSERT_NEAR(bm25_idf(100, 50), std::log(2.0), 1e-6);
+}
+
+TEST(BM25IdfTest, StaysPositiveWhenTermInEveryDocument) {
+    // df_t == N: the +1 keeps IDF strictly positive instead of zero.
+    // (100-100+0.5)/(100+0.5) + 1 = 1 + 0.5/100.5.
+    float idf = bm25_idf(100, 100);
+    ASSERT_GT(idf, 0.0f);
+    ASSERT_NEAR(idf, std::log1p(0.5 / 100.5), 1e-7);
+}
+
+TEST(BM25IdfTest, MonotonicDecreasingInDocumentFrequency) {
+    ASSERT_GT(bm25_idf(1000, 1), bm25_idf(1000, 10));
+    ASSERT_GT(bm25_idf(1000, 10), bm25_idf(1000, 500));
+    ASSERT_GT(bm25_idf(1000, 500), bm25_idf(1000, 1000));
+}
+
+TEST(BM25IdfTest, ExactAtCorpusScale) {
+    // N past float's exact-integer range (2^24): double precision must keep
+    // IDF accurate. N=345,000,000, df=1 -> ln((N - 0.5)/1.5 + 1).
+    const double N = 345000000.0;
+    ASSERT_NEAR(bm25_idf(345000000ull, 1), std::log1p((N - 0.5) / 1.5), 1e-5);
+}
+
+TEST(CalcBM25Test, ScoreStaysPositiveWhenTermInEveryDocument) {
+    // df_t == N still carries a small positive IDF, so the score is
+    // positive rather than zero.
     float score = calc_BM25(/*N=*/100, /*df_t=*/100, /*tf=*/50.0f, /*doc_len=*/3.0f, /*avgdl=*/10.0f);
-    ASSERT_NEAR(score, 0.0f, 1e-6);
+    ASSERT_GT(score, 0.0f);
 }
 
 TEST(CalcBM25Test, EqualsIdfTimesSaturation) {
     unsigned long long N = 100, df_t = 50;
     float tf = 3.0f, doc_len = 10.0f, avgdl = 10.0f, k1 = 1.2f, b = 0.75f;
 
-    float expected_idf = std::log((float)N / (float)df_t);
+    // Documented formula, written out independently of bm25_idf.
+    float expected_idf = std::log(((double)N - df_t + 0.5) / (df_t + 0.5) + 1.0);
     float expected = expected_idf * bm25_saturation(k1, b, tf, doc_len, avgdl);
 
     ASSERT_NEAR(calc_BM25(N, df_t, tf, doc_len, avgdl, k1, b), expected, 1e-5);

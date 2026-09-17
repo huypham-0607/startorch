@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <filesystem>
 #include <bit>
+#include <functional>
 #include <queue>
 #include <chrono>
 
@@ -113,7 +114,8 @@ unsigned int PostingPointer::get_frequency() const {
     return freq;
 }
 
-void PostingPointer::next_shallow(const unsigned long long target_doc_id) {
+// Index of the block that would contain target_doc_id.
+int PostingPointer::find_block(const unsigned long long target_doc_id) const {
     auto it = std::upper_bound(
         term_meta->block_meta_list.begin(),
         term_meta->block_meta_list.end(),
@@ -123,7 +125,7 @@ void PostingPointer::next_shallow(const unsigned long long target_doc_id) {
         }
     );
     int new_block = static_cast<int>((it - term_meta->block_meta_list.begin()) - 1);
-    
+
     // Impossible given how BMW works.
     if (new_block < cur_block_id) {
         throw std::runtime_error(std::format(
@@ -132,27 +134,15 @@ void PostingPointer::next_shallow(const unsigned long long target_doc_id) {
         ));
     }
 
-    cur_block_id = new_block;
+    return new_block;
+}
+
+void PostingPointer::next_shallow(const unsigned long long target_doc_id) {
+    cur_block_id = find_block(target_doc_id);
 }
 
 void PostingPointer::next_shallow_deep(const unsigned long long target_doc_id) {
-    auto it = std::upper_bound(
-        term_meta->block_meta_list.begin(),
-        term_meta->block_meta_list.end(),
-        target_doc_id,
-        [&] (unsigned long long val, BlockMeta x) {
-            return val < x.doc_id;
-        }
-    );
-    int new_block = static_cast<int>((it - term_meta->block_meta_list.begin()) - 1);
-    
-    // Impossible given how BMW works.
-    if (new_block < cur_block_id) {
-        throw std::runtime_error(std::format(
-            "Unable to advance PostingPointer: new_block id {} is less than cur_block id {}.",
-            new_block, cur_block_id
-        ));
-    }
+    int new_block = find_block(target_doc_id);
 
     if (new_block > deep_block_id) {
         deep_block_id = new_block;
@@ -332,37 +322,6 @@ void advance_prefix(
     }
 }
 
-void advance_one_excluding(
-    std::vector<PostingPointer>& postings,
-    const int pivot,
-    const unsigned long long N,
-    const unsigned long long target_doc_id
-) {
-    unsigned long long doc = postings[pivot].get_doc_id();
-    
-    unsigned int min_df = N+1;
-    int advance_id = -1;
-
-    int idx = 0;
-    while (idx < static_cast<int>(postings.size()) && postings[idx].get_doc_id() < doc) {
-
-        const unsigned int df = postings[idx].get_doc_count();
-        if (df < min_df) {
-            min_df = df;
-            advance_id = idx;
-        }
-
-        ++idx;
-    }
-    if (advance_id == -1) {
-        throw std::runtime_error(std::format(
-            "Unable to find advancing index where doc_id < {}.",
-            doc
-        ));
-    }
-    postings[advance_id].next(target_doc_id);
-}
-
 unsigned long long get_new_candidate(
     std::vector<PostingPointer>& postings,
     const int pivot
@@ -382,328 +341,180 @@ unsigned long long get_new_candidate(
     return target_doc_id;
 }
 
-void advance_one_including(
-    std::vector<PostingPointer>& postings,
-    const int pivot,
-    const unsigned long long N,
-    const unsigned long long target_doc_id
-) {
-    unsigned long long doc = postings[pivot].get_doc_id();
-    
-    unsigned int min_df = N+1;
-    int advance_id = -1;
+QueryEngine::QueryEngine(const fs::path& meta_path) : logger(__FILE_NAME__, Logger::INFO) {
+    logger.log("Initializing QueryEngine...");
+    logger.log("Loading metadata and term_meta_mapping...");
 
-    int idx = 0;
-    while (idx < static_cast<int>(postings.size()) && postings[idx].get_doc_id() <= doc) {
+    // avgdl comes from metadata, not recomputed: it must be exactly the
+    // value merge_inverted_blocks built the block upper bounds with, or
+    // those bounds can underestimate real scores.
+    IndexMeta index = load_index(meta_path);
+    in_path = index.posting_dir;
+    k1 = index.k1;
+    b = index.b;
+    avgdl = index.avgdl;
+    block_size = index.block_size;
+    split_size = index.split_size;
 
-        const unsigned int df = postings[idx].get_doc_count();
-        if (df < min_df) {
-            min_df = df;
-            advance_id = idx;
+    logger.log("Finished loading metadata and term_meta_mapping, loading doc_len_list...");
+
+    read_doc_len_list(in_path / file_names::DOC_LEN_LIST, doc_len_list);
+
+    logger.log("Finished loading doc_len_list. Opening posting files...");
+
+    for (auto& [term, metadata] : index.terms) {
+        unsigned int file_index = metadata.file_index;
+        term_meta_mapping.emplace(std::move(term), std::move(metadata));
+
+        if (file_index_mapping.find(file_index) == file_index_mapping.end()) {
+            file_index_mapping.emplace(
+                file_index,
+                in_path / file_names::posting_file_name(file_index)
+            );
         }
-
-        ++idx;
     }
-    if (advance_id == -1) {
-        throw std::runtime_error(std::format(
-            "Unable to find advancing index where doc_id < {}.",
-            doc
-        ));
-    }
-    postings[advance_id].next(target_doc_id);
+    logger.log("Finished opening posting files. QueryEngine ready.");
 }
 
-class QueryEngine{
-public:
-    QueryEngine(
-        const fs::path meta_path,
-        const Logger& _logger
-    ) : logger(_logger) {
-        logger.log("Initializing QueryEngine...");
-        logger.log("Loading metadata...");
-
-        // Load metadata
-        read_metadata(meta_path, in_path, doc_len_path, doc_len_meta_path, k1, b, block_size, split_size);
-
-        logger.log("Finished loading metadata, loading doc_len_list...");
-
-        // Load doc_len_list
-        read_doc_len_list(doc_len_path, doc_len_list);
-        const auto [total_docs, total_frequency] = read_doc_len_meta(doc_len_meta_path);
-
-        // Compute avgdl
-        avgdl = static_cast<float>(static_cast<double>(total_frequency)/static_cast<double>(total_docs));
-
-        logger.log("Finished loading doc_len_list. Loading term_meta_mapping...");
-
-        // Load term_meta_mapping
-        std::vector<std::pair<std::string, TermMeta>> raw_term_meta_mapping;
-        raw_term_meta_mapping = read_block_meta_file(
-            in_path / file_names::BLOCK_META
-        );
-
-        for (const auto& [term,metadata] : raw_term_meta_mapping) {
-            term_meta_mapping.emplace(std::move(term), std::move(metadata));
-            
-            unsigned int file_index = metadata.file_index;
-            if (file_index_mapping.find(file_index) == file_index_mapping.end()) {
-                file_index_mapping.emplace(
-                    file_index,
-                    in_path / file_names::posting_file_name(file_index)
-                );
-            }
-        }
-        logger.log("Finished loading term_meta_mapping. QueryEngine ready.");
-    }
-
-    std::vector<std::pair<float, unsigned long long>> query_exhaustive(
-        const std::vector<std::string>& raw_terms,
-        const int k
-    ) {
-
-        // Filtering terms not indexed
-        std::vector<std::string> terms;
-        for (const auto& term : raw_terms) {
-            if (term_meta_mapping.find(term) != term_meta_mapping.end()) {
-                terms.push_back(term);
-            }
-        }
-
-        std::priority_queue<
-            std::pair<float, unsigned long long>,
-            std::vector<std::pair<float, unsigned long long>>,
-            std::greater<std::pair<float, unsigned long long>>
-        > top_k;
-
-        for (int i = 0; i < k; i++) top_k.push(std::make_pair(-1, MAX_DOC_ID));
-
-        std::vector<PostingPointer> postings;
-
-        for (const auto& term : terms) {
-            postings.push_back(PostingPointer(
-                term, block_size, term_meta_mapping, file_index_mapping
-            ));
-        }
-
-        for (unsigned long long epoch = 0; epoch < (1LL<<32); epoch++) {
-            sort_posting(postings);
-
-            if (postings.empty() || postings.front().get_doc_id() == MAX_DOC_ID) break;
-            unsigned long long doc = postings.front().get_doc_id();
-
-            float score = evaluate_prefix(
-                postings,
-                0,
-                doc_len_list,
-                avgdl,
-                k1,
-                b
-            );
-
-            if (score > top_k.top().first) {
-                top_k.pop();
-                top_k.push(std::make_pair(score, doc));
-            }
-
-            advance_prefix(postings, 0, doc + 1);
-        }
-        std::vector<std::pair<float, unsigned long long>> res;
-        while (!top_k.empty()) {
-            if (top_k.top().first != -1) res.push_back(top_k.top());
-            top_k.pop();
-        }
-        std::reverse(res.begin(), res.end());
-        return res;
-    }
-
-    std::vector<std::pair<float, unsigned long long>> query(
-        const std::vector<std::string>& raw_terms,
-        const int k
-    ) {
-        // Filtering terms not indexed
-        std::vector<std::string> terms;
-        for (const auto& term : raw_terms) {
-            if (term_meta_mapping.find(term) != term_meta_mapping.end()) {
-                terms.push_back(term);
-            }
-        }
-
-        std::priority_queue<
-            std::pair<float, unsigned long long>,
-            std::vector<std::pair<float, unsigned long long>>,
-            std::greater<std::pair<float, unsigned long long>>
-        > top_k;
-
-        for (int i = 0; i < k; i++) top_k.push(std::make_pair(-1, MAX_DOC_ID));
-
-        std::vector<PostingPointer> postings;
-
-        for (const auto& term : terms) {
-            postings.push_back(PostingPointer(
-                term, block_size, term_meta_mapping, file_index_mapping
-            ));
-        }
-
-        for (unsigned long long epoch = 0; epoch < (1LL<<32); epoch++) {
-            sort_posting(postings);
-            
-            float theta = top_k.top().first;
-            int pivot = find_pivot(postings, theta);
-
-            if (pivot == static_cast<int>(postings.size())) break;
-            unsigned long long doc = postings[pivot].get_doc_id();
-            if (doc == MAX_DOC_ID) break;
-            
-            for (int idx = 0; idx < pivot; idx++) {
-                postings[idx].next_shallow(doc);
-            }
-
-
-            bool flag = check_block_max(postings, pivot, theta);
-            if (flag) {
-                if (postings[0].get_doc_id() == doc) {
-                    float score = evaluate_prefix(
-                        postings,
-                        pivot,
-                        doc_len_list,
-                        avgdl,
-                        k1,
-                        b
-                    );
-                    if (score > theta) {
-                        top_k.pop();
-                        top_k.push(std::make_pair(score, doc));
-                    }
-                    advance_prefix(
-                        postings,
-                        pivot,
-                        doc + 1
-                    );
-                }
-                else {
-                    advance_one_excluding(postings, pivot, doc_len_list.size(), doc);
-                }
-            }
-            else {
-                unsigned long long target_doc_id = get_new_candidate(postings, pivot);
-                advance_one_including(postings, pivot, doc_len_list.size(), target_doc_id);
-            }
-        }
-
-        std::vector<std::pair<float, unsigned long long>> res;
-        while (!top_k.empty()) {
-            if (top_k.top().first != -1) res.push_back(top_k.top());
-            top_k.pop();
-        }
-        std::reverse(res.begin(), res.end());
-        return res;
-    }
-
-private:
-    Logger logger;
-    fs::path in_path, doc_len_path, doc_len_meta_path;
-    float k1, b;
-    int block_size;
-    size_t split_size;
-    std::vector<unsigned int> doc_len_list;
-    float avgdl;
-    std::unordered_map<std::string, TermMeta> term_meta_mapping;
-    std::unordered_map<unsigned int, SafeFileMmap> file_index_mapping;
-};
-
-std::pair<std::vector<std::pair<float, unsigned long long>>, std::chrono::duration<double, std::milli>> query (
-    const fs::path meta_path,
-    const std::vector<std::string> raw_terms,
+std::pair<QueryResult, QueryElapsed> QueryEngine::query(
+    const std::vector<std::string>& raw_terms,
     const int k
 ) {
-    Logger logger(__FILE_NAME__, Logger::INFO);
-    QueryEngine engine(meta_path, logger);
-
     auto start = std::chrono::high_resolution_clock::now();
-    std::vector<std::pair<float, unsigned long long>> result = engine.query(raw_terms, k);
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed = end - start;
-    logger.log(std::format("Finished querying. Time elapsed: {}", elapsed));
-    
-    return std::make_pair(result,elapsed);
+    QueryResult result = search(raw_terms, k);
+    QueryElapsed elapsed = std::chrono::high_resolution_clock::now() - start;
+
+    logger.log(std::format("Finished query. Time elapsed: {}", elapsed));
+    return std::make_pair(std::move(result), elapsed);
 }
 
-std::vector<std::vector<std::pair<float, unsigned long long>>> query_batch (
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
+std::pair<QueryResult, QueryElapsed> QueryEngine::query_exhaustive(
+    const std::vector<std::string>& raw_terms,
+    const int k
 ) {
-    Logger logger(__FILE_NAME__, Logger::INFO);
-    QueryEngine engine(meta_path, logger);
+    auto start = std::chrono::high_resolution_clock::now();
+    QueryResult result = search_exhaustive(raw_terms, k);
+    QueryElapsed elapsed = std::chrono::high_resolution_clock::now() - start;
 
-    std::vector<std::vector<std::pair<float, unsigned long long>>> results;
-    for (size_t i = 0; i < raw_terms.size(); i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        results.push_back(engine.query(raw_terms[i], k[i]));
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed = end - start;
-        logger.log(std::format("Finished query {}. Time elapsed: {}", i+1, elapsed));
-    }
-
-    return results;
+    logger.log(std::format("Finished exhaustive query. Time elapsed: {}", elapsed));
+    return std::make_pair(std::move(result), elapsed);
 }
 
-std::pair<std::vector<std::vector<std::pair<float, unsigned long long>>>, 
-        std::pair<std::chrono::duration<double, std::milli>, std::vector<std::chrono::duration<double, std::milli>>>>
-        query_batch_benchmark (
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
+QueryResult QueryEngine::search(
+    const std::vector<std::string>& raw_terms,
+    const int k
 ) {
-    Logger logger(__FILE_NAME__, Logger::INFO);
-    auto start_engine = std::chrono::high_resolution_clock::now();
-    QueryEngine engine(meta_path, logger);
-    auto end_engine = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed_engine = end_engine - start_engine;
+    std::vector<PostingPointer> postings = open_postings(raw_terms);
+    TopK top_k = make_top_k(k);
 
-    std::vector<std::vector<std::pair<float, unsigned long long>>> results;
-    std::vector<std::chrono::duration<double, std::milli>> benchmarks;
-    for (size_t i = 0; i < raw_terms.size(); i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        results.push_back(engine.query(raw_terms[i], k[i]));
+    for (unsigned long long epoch = 0; epoch < (1LL<<32); epoch++) {
+        sort_posting(postings);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed = end - start;
-        logger.log(std::format("Finished query {}. Time elapsed: {}", i+1, elapsed));
-        benchmarks.push_back(elapsed);
+        float theta = top_k.top().first;
+        int pivot = find_pivot(postings, theta);
+
+        if (pivot == static_cast<int>(postings.size())) break;
+        unsigned long long doc = postings[pivot].get_doc_id();
+        if (doc == MAX_DOC_ID) break;
+
+        for (int idx = 0; idx < pivot; idx++) {
+            postings[idx].next_shallow(doc);
+        }
+
+        bool flag = check_block_max(postings, pivot, theta);
+        if (flag) {
+            if (postings[0].get_doc_id() == doc) {
+                float score = evaluate_prefix(
+                    postings,
+                    pivot,
+                    doc_len_list,
+                    avgdl,
+                    k1,
+                    b
+                );
+                if (score > theta) {
+                    top_k.pop();
+                    top_k.push(std::make_pair(score, doc));
+                }
+                advance_prefix(
+                    postings,
+                    pivot,
+                    doc + 1
+                );
+            }
+            else {
+                // std::less: only cursors lagging behind the pivot doc move, up to doc itself.
+                advance_one(postings, pivot, doc_len_list.size(), doc, std::less<>{});
+            }
+        }
+        else {
+            unsigned long long target_doc_id = get_new_candidate(postings, pivot);
+            // std::less_equal: no doc before target_doc_id can beat theta, so the pivot's run may skip too.
+            advance_one(postings, pivot, doc_len_list.size(), target_doc_id, std::less_equal<>{});
+        }
     }
-
-    return std::make_pair(results, std::make_pair(elapsed_engine, benchmarks));
+    return drain_top_k(top_k);
 }
 
-std::pair<std::vector<std::vector<std::pair<float, unsigned long long>>>, 
-        std::pair<std::chrono::duration<double, std::milli>, std::vector<std::chrono::duration<double, std::milli>>>>
-        query_batch_exhaustive_benchmark (
-    const fs::path meta_path,
-    const std::vector<std::vector<std::string>> raw_terms,
-    const std::vector<int> k
+QueryResult QueryEngine::search_exhaustive(
+    const std::vector<std::string>& raw_terms,
+    const int k
 ) {
-    Logger logger(__FILE_NAME__, Logger::INFO);
-    auto start_engine = std::chrono::high_resolution_clock::now();
-    QueryEngine engine(meta_path, logger);
-    auto end_engine = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double, std::milli> elapsed_engine = end_engine - start_engine;
+    std::vector<PostingPointer> postings = open_postings(raw_terms);
+    TopK top_k = make_top_k(k);
 
-    std::vector<std::vector<std::pair<float, unsigned long long>>> results;
-    std::vector<std::chrono::duration<double, std::milli>> benchmarks;
-    for (size_t i = 0; i < raw_terms.size(); i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        
-        results.push_back(engine.query_exhaustive(raw_terms[i], k[i]));
+    for (unsigned long long epoch = 0; epoch < (1LL<<32); epoch++) {
+        sort_posting(postings);
 
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double, std::milli> elapsed = end - start;
-        logger.log(std::format("Finished query {}. Time elapsed: {}", i+1, elapsed));
-        benchmarks.push_back(elapsed);
+        if (postings.empty() || postings.front().get_doc_id() == MAX_DOC_ID) break;
+        unsigned long long doc = postings.front().get_doc_id();
+
+        float score = evaluate_prefix(
+            postings,
+            0,
+            doc_len_list,
+            avgdl,
+            k1,
+            b
+        );
+
+        if (score > top_k.top().first) {
+            top_k.pop();
+            top_k.push(std::make_pair(score, doc));
+        }
+
+        advance_prefix(postings, 0, doc + 1);
     }
+    return drain_top_k(top_k);
+}
 
-    return std::make_pair(results, std::make_pair(elapsed_engine, benchmarks));
+// One cursor per query term; terms not in the index are dropped.
+std::vector<PostingPointer> QueryEngine::open_postings(const std::vector<std::string>& raw_terms) {
+    std::vector<PostingPointer> postings;
+    for (const auto& term : raw_terms) {
+        if (term_meta_mapping.find(term) != term_meta_mapping.end()) {
+            postings.push_back(PostingPointer(
+                term, block_size, term_meta_mapping, file_index_mapping
+            ));
+        }
+    }
+    return postings;
+}
+
+// Min-heap seeded with k sentinels (score -1), so top() is theta from the start.
+QueryEngine::TopK QueryEngine::make_top_k(const int k) {
+    TopK top_k;
+    for (int i = 0; i < k; i++) top_k.push(std::make_pair(-1, MAX_DOC_ID));
+    return top_k;
+}
+
+// Best-first results with the unfilled sentinels removed.
+QueryResult QueryEngine::drain_top_k(TopK& top_k) {
+    QueryResult res;
+    while (!top_k.empty()) {
+        if (top_k.top().first != -1) res.push_back(top_k.top());
+        top_k.pop();
+    }
+    std::reverse(res.begin(), res.end());
+    return res;
 }

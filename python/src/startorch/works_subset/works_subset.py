@@ -177,7 +177,7 @@ def main():
     paths = config["data-path"]
     data_path = _resolve(paths["data-path"])
     full_corpus_path = data_path / paths["full-corpus-folder"]
-    subset_path = data_path / paths["works-subset-folder"] / "full_en"
+    subset_path = data_path / paths["works-subset-folder"] / "full-en"
     spill_path = _resolve(config["duckdb"]["spill-path"])
     condition = config["works-subset"]["subset-profiles"]["full-en"]
 

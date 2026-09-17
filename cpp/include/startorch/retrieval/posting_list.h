@@ -27,6 +27,12 @@ public:
     const PostingItem& operator[] (size_t idx) const;
 
     void clear();
+
+    // Order entries by doc_id, merging entries that share a doc_id by summing
+    // their freq. add_document only merges into the last entry, so a list
+    // built from a stream that isn't in doc_id order needs this before its
+    // doc_id gaps are encoded.
+    void sort();
 };
 
 #endif

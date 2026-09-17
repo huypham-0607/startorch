@@ -63,6 +63,43 @@ TEST(PostingListTest, ClearEmptiesList) {
     ASSERT_FALSE(list.has_document(2));
 }
 
+TEST(PostingListTest, SortOrdersByDocIdAndMergesRepeatedDocIds) {
+    // Built from a stream not in doc_id order: doc 3 appears twice, but not
+    // consecutively, so add_document can't merge it.
+    PostingList list;
+    list.add_document(7);
+    list.add_document(3, 2);
+    list.add_document(9);
+    list.add_document(3);
+
+    list.sort();
+
+    ASSERT_EQ(list.size(), 3);
+    ASSERT_EQ(list[0].doc_id, 3); ASSERT_EQ(list[0].freq, 3);
+    ASSERT_EQ(list[1].doc_id, 7); ASSERT_EQ(list[1].freq, 1);
+    ASSERT_EQ(list[2].doc_id, 9); ASSERT_EQ(list[2].freq, 1);
+}
+
+TEST(PostingListTest, SortLeavesSortedListUnchanged) {
+    PostingList list;
+    list.add_document(1);
+    list.add_document(4, 5);
+    list.add_document(8);
+
+    list.sort();
+
+    ASSERT_EQ(list.size(), 3);
+    ASSERT_EQ(list[0].doc_id, 1); ASSERT_EQ(list[0].freq, 1);
+    ASSERT_EQ(list[1].doc_id, 4); ASSERT_EQ(list[1].freq, 5);
+    ASSERT_EQ(list[2].doc_id, 8); ASSERT_EQ(list[2].freq, 1);
+}
+
+TEST(PostingListTest, SortOnEmptyListIsNoop) {
+    PostingList list;
+    list.sort();
+    ASSERT_EQ(list.size(), 0);
+}
+
 TEST(PostingItemTest, OperatorLessComparesDocIdThenFreq) {
     PostingItem a(5, 10);
     PostingItem b(5, 20);

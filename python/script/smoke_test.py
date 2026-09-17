@@ -94,7 +94,7 @@ def _():
     assert s.subset_path == Path("subset")
     assert s.spill_path == Path("spill")
     assert s.filter_condition == "language = 'en'"
-    assert s.rows_per_chunk == 10000000
+    assert s.rows_per_chunk == 2000000
 
 
 @check("project-config.toml's subset-profiles are all valid DuckDB boolean expressions")

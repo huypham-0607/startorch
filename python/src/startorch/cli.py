@@ -24,19 +24,16 @@ def resolve_path(raw: str) -> Path:
     p = Path(raw)
     return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
 
-def get_subset_folder(profile: str) -> str:
-    return profile.replace("-", "_")
-
 def get_profile_data_path(profile: str, config: dict) -> Path:
     paths = config["data-path"]
     return (
         resolve_path(paths["data-path"]) / paths["full-corpus-folder"] if (profile == "full-corpus")
-        else resolve_path(paths["data-path"]) / paths["works-subset-folder"] / get_subset_folder(profile)
+        else resolve_path(paths["data-path"]) / paths["works-subset-folder"] / profile
     )
 
 def get_profile_posting_path(profile: str, config: dict) -> Path:
     paths = config["data-path"]
-    return resolve_path(paths["posting-path"]) / get_subset_folder(profile)
+    return resolve_path(paths["posting-path"]) / profile
 
 def cmd_ingest(args: argparse.Namespace, config: dict) -> None:
     paths = config["data-path"]

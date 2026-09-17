@@ -88,7 +88,7 @@ std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
 
 /**
  * @brief Write index build metadata (posting_dir, doc_len_dir,
- * doc_len_meta_dir, k1, b, block_size, split_size) in two forms: a
+ * doc_len_meta_dir, k1, b, avgdl, block_size, split_size) in two forms: a
  * plain-text key=value file at out_path, one field per line - for humans
  * to read/inspect, never read back programmatically - and a binary twin
  * at out_path with its extension replaced by ".bin" - the exact,
@@ -103,6 +103,8 @@ std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
  * @param doc_len_meta_dir path to this index's doc_len_meta.bin
  * @param k1 BM25 k1 parameter the index was built with
  * @param b BM25 b parameter the index was built with
+ * @param avgdl average document length the block upper bounds were built
+ * with - the query engine must score with this exact value
  * @param block_size BMW block size the index was built with
  * @param split_size posting-file split threshold the index was built with
  */
@@ -113,6 +115,7 @@ void write_metadata(
     const std::filesystem::path& doc_len_meta_dir,
     const float k1,
     const float b,
+    const float avgdl,
     const int block_size,
     const size_t split_size
 );
@@ -131,16 +134,52 @@ void read_metadata(
     std::filesystem::path& doc_len_meta,
     float& k1,
     float& b,
+    float& avgdl,
     int& block_size,
     size_t& split_size
 );
 
 /**
- * @brief Read block metadata and return list list of term - df pair.
- * 
+ * @brief Everything load_index reads to open an index: the build parameters
+ * from metadata.bin, plus every term's TermMeta from block_meta.bin.
+ *
+ * posting_dir is the folder holding metadata.bin, block_meta.bin,
+ * doc_len_list.bin and posting_*.bin.
+ */
+struct IndexMeta {
+    std::filesystem::path posting_dir;
+    float k1;
+    float b;
+    float avgdl;
+    int block_size;
+    size_t split_size;
+    std::vector<std::pair<std::string, TermMeta>> terms;
+};
+
+/**
+ * @brief The one way to open an index: read metadata.bin at meta_path, then
+ * block_meta.bin next to it. Every reader of an index (QueryEngine,
+ * read_term_df_mapping) goes through here.
+ *
+ * Index files are resolved relative to meta_path's own folder, not the
+ * absolute paths stored inside metadata.bin. merge_inverted_blocks always
+ * writes metadata into the posting folder itself, so both give the same files
+ * for a freshly built index, but the stored paths go stale once the index
+ * folder is moved or renamed. The stored paths are still read, so the file
+ * format is unchanged.
+ *
+ * @param meta_path path to the index's metadata.bin
+ */
+IndexMeta load_index(const std::filesystem::path& meta_path);
+
+/**
+ * @brief Return every indexed term with its document frequency, sorted by
+ * descending df.
+ *
+ * @param meta_path path to the index's metadata.bin
  */
 std::vector<std::pair<std::string, unsigned int>> read_term_df_mapping(
-    const std::filesystem::path& in_path
+    const std::filesystem::path& meta_path
 );
 
 #endif
