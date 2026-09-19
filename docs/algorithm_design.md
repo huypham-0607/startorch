@@ -167,6 +167,54 @@ Baseline Models:
 - Would be too ambitous computationally.
 - Perhaps would revisit in the future (after ~3 months at least)
 
+#### Feasibility check (2026-09-18) — still dropped
+
+Re-checked on request. The decision stands. The numbers below are here so the revisit doesn't have to redo them.
+
+**Hardware.**
+- Intel Core Ultra 7 255HX (20 cores), 31 GB RAM.
+- RTX 5060 Laptop GPU with 8 GB of video memory.
+- 379 GB free on `/data`, 433 GB free on `/home`.
+- No ML libraries installed yet (torch, sentence-transformers, faiss).
+
+**Full-en at scale** (345,897,793 documents). Estimates, not measured; the first step of any revisit is timing encoding on about 100k documents.
+
+| | 384 dimensions | 768 dimensions |
+|---|---|---|
+| int8 vectors | 133 GB | 266 GB |
+| fp16 vectors | 266 GB | 531 GB |
+| 1-bit codes | 17 GB | 33 GB |
+| GPU encoding, title + keywords | roughly 6-20 h (small model) | roughly 1-3 days (base model) |
+
+- **An in-memory HNSW index does not fit.** Its layer-0 links alone take about 44 GB at M=16, before any vectors.
+- **Indexes that do fit in 31 GB** keep compressed codes in RAM and full vectors on SSD:
+  - IVF-PQ at 32-64 bytes per vector, about 11-22 GB;
+  - 1-bit codes scanned brute force, then rescored from int8 vectors on SSD;
+  - a DiskANN-style graph on SSD.
+
+  All three compete for RAM with the query engine's own index load, about 8 GB on full-en.
+- **Data caveat.** Documents have only a title, topic labels, and keywords; abstracts are excluded (47.72% null). The topic labels are shared across huge numbers of documents and would dominate the embeddings, so embed title plus keywords.
+
+**Three tiers, cheapest first.**
+
+1. **Cross-encoder rerank of BMW's top 100 at query time.**
+   - No corpus encoding and no new storage.
+   - Roughly tens of milliseconds per query on the GPU.
+   - Only reorders documents BMW already found.
+2. **Rerank using precomputed document embeddings.**
+   - One full-corpus encoding and about 133 GB of int8 vectors.
+   - Per query, only BMW's candidates are looked up by `mapped_id` and scored, which is almost free.
+   - Same limit as tier 1.
+3. **Dense first-stage retrieval, fused with BMW** (for example, reciprocal rank fusion).
+   - The only tier that finds relevant papers sharing no vocabulary with the query.
+   - Needs one of the compressed indexes above at full-en scale.
+
+**When revisited, start with tier 3 plus fusion on MS MARCO.**
+- Its 8,841,823 passages come to about 7 GB of 384-dimension fp16 vectors, so an in-memory HNSW index fits.
+- The existing MS MARCO pipeline already produces run files, and MRR@10 and Recall@1000 compare directly with BMW and Anserini.
+- Scale to full-en only if it clearly beats BMW.
+- An ANN index (HNSW or IVF-PQ) in C++ is the natural hands-on part, like BMW was. The embedding model would come from a library.
+
 
 # 6. Project tree
 

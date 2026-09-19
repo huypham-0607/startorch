@@ -4,6 +4,7 @@
  * posting list & block metadata for corpus.
  */
 
+#include "startorch/retrieval/build_params.h"
 #include "startorch/retrieval/merge_inverted_blocks.h"
 #include "startorch/utils/logger.h"
 
@@ -15,17 +16,20 @@
 namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
+    // Defaults and valid ranges both come from BuildParams, so this app and
+    // the Python build accept exactly the same values.
+    BuildParams params;
 
     std::string usage_err = std::format(
         "Usage: {} <in_dir> <out_dir> <optional_flags>\n"
         "out_dir must already contain doc_len_list.bin and doc_len_meta.bin\n"
         "(construct_doc_len_list output).\n"
         "Optional flags:\n"
-        "k1=(float)                 - k1 parameter in BM25. [1,2]\n"
-        "b=(float)                  - b parameter in BM25. [0,1]\n"
-        "block_size=(unsigned int)  - Block partition size for Block-Max WAND.\n"
-        "split_size=(size_t)  - Splitting threshold for posting list serialization.",
-        argv[0]
+        "k1=(float)                 - k1 parameter in BM25, (0, 5]. Default {}.\n"
+        "b=(float)                  - b parameter in BM25, [0, 1]. Default {}.\n"
+        "block_size=(int)           - Block partition size for Block-Max WAND, > 0. Default {}.\n"
+        "split_size=(size_t)        - Splitting threshold for posting list serialization, > 0. Default {}.",
+        argv[0], params.k1, params.b, params.block_size, params.split_size
     );
 
     if (argc < 3 || argc > 7) {
@@ -36,10 +40,6 @@ int main(int argc, char** argv) {
     fs::path in_dir = argv[1];
     fs::path out_dir = argv[2];
 
-    float k1 = 1.2f, b = 0.75f;
-    int block_size = 128;
-    size_t split_size = 1ull << 30;
-
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         auto eq = arg.find('=');
@@ -48,54 +48,28 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::string key = arg.substr(0, eq), val = arg.substr(eq + 1);
-        if (key == "k1") {
-            try {
-                k1 = std::stof(val);
-            }
-            catch (const std::exception& e) {
-                std::cerr << std::format("Cannot convert value {} to type 'float' for flag {}", val, key) << "\n";
-                return 1;
-            }
-            if (k1 < 0.1f || 5.0f < k1) {
-                std::cerr << std::format("Value {} for flag {} out of range [0.1,5.0]", k1, key) << "\n";
-                return 1;  
-            }
-        }
-        else if (key == "b") {
-            try {
-                b = std::stof(val);
-            }
-            catch (const std::exception& e) {
-                std::cerr << std::format("Cannot convert value {} to type 'float' for flag {}", val, key) << "\n";
-                return 1;
-            }
-            if (b < 0 || 1 < b) {
-                std::cerr << std::format("Value {} for flag {} out of range [0,1]", b, key) << "\n";
-                return 1;  
-            }
-        }
-        else if (key == "block_size") {
-            try {
-                block_size = std::stoi(val);
-            }
-            catch (const std::exception& e) {
-                std::cerr << std::format("Cannot convert value {} to type 'int' for flag {}", val, key) << "\n";
+        try {
+            if (key == "k1") params.k1 = std::stof(val);
+            else if (key == "b") params.b = std::stof(val);
+            else if (key == "block_size") params.block_size = std::stoi(val);
+            else if (key == "split_size") params.split_size = std::stoull(val);
+            else {
+                std::cerr << std::format("Unknown flag {}.", key) << "\n";
                 return 1;
             }
         }
-        else if (key == "split_size") {
-            try {
-                split_size = std::stoull(val);
-            }
-            catch (const std::exception& e) {
-                std::cerr << std::format("Cannot convert value {} to type 'size_t' for flag {}", val, key) << "\n";
-                return 1;
-            }
-        }
-        else {
-            std::cerr << std::format("Unknown flag {}.", key) << "\n";
+        catch (const std::exception& e) {
+            std::cerr << std::format("Cannot convert value {} for flag {}.", val, key) << "\n";
             return 1;
         }
+    }
+
+    try {
+        params.validate();
+    }
+    catch (const std::invalid_argument& e) {
+        std::cerr << e.what() << "\n" << usage_err << "\n";
+        return 1;
     }
 
     Logger logger(__FILE_NAME__, Logger::INFO);
@@ -112,20 +86,13 @@ int main(int argc, char** argv) {
             "split_size = {}",
             in_dir.string(),
             out_dir.string(),
-            k1,
-            b,
-            block_size,
-            split_size
+            params.k1,
+            params.b,
+            params.block_size,
+            params.split_size
         ));
 
-        merge_inverted_blocks(
-            in_dir,
-            out_dir,
-            k1,
-            b,
-            block_size,
-            split_size
-        );
+        merge_inverted_blocks(in_dir, out_dir, params);
 
         logger.log("Finished merging inverted blocks.");
     } catch (const std::exception& e) {

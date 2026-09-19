@@ -11,7 +11,7 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from startorch import get_logger, get_current_time
+from startorch.utils import fetch_one, get_current_time, get_logger
 from botocore import UNSIGNED
 from botocore.client import Config
 
@@ -440,7 +440,7 @@ class WorksIngestor(EntityIngestor):
         rel = db.read_parquet(shard_path).select(*self.extracted_columns)
 
         # Number of records is an invariant after the transform. Count here for cheaper computation.
-        record_count = rel.aggregate("count(*)").fetchone()[0]
+        record_count = fetch_one(rel.aggregate("count(*)"))[0]
         rel = rel.select("""
             * REPLACE (
                 replace(id, 'https://openalex.org/', '') AS id,
@@ -521,13 +521,13 @@ class WorksIngestor(EntityIngestor):
 
         rel = db.read_parquet(shard_path)
         cols = rel.columns
-        compact_record_count = rel.aggregate("count(*) AS total").fetchone()[0]
+        compact_record_count = fetch_one(rel.aggregate("count(*) AS total"))[0]
         compact_content_length = os.path.getsize(shard_path)
 
         # referenced_works_count vs actual list length - NULL counts as a mismatch
-        link_mismatch_count = rel.aggregate(
+        link_mismatch_count = fetch_one(rel.aggregate(
             "count(*) FILTER (WHERE referenced_works_count IS DISTINCT FROM len(referenced_works)) AS bad"
-        ).fetchone()[0]
+        ))[0]
 
         # column-set check against the expected schema
         expected_columns = self.columns
@@ -630,9 +630,9 @@ class WorksIngestor(EntityIngestor):
             p = str(path)
 
             # Getting record count & size per shard
-            record_count = con.execute(
+            record_count = fetch_one(con.execute(
                 "SELECT count(*) FROM read_parquet(?)", [p]
-            ).fetchone()[0]
+            ))[0]
             size = os.path.getsize(p)
 
             compact_manifest["files"].append({

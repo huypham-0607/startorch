@@ -22,7 +22,34 @@ const std::pair<unsigned long long, unsigned long long> read_doc_len_meta(
 );
 
 /**
- * @brief Construct doc_id - doc_len sequence (out_dir/doc_len_list.bin).
+ * @brief Token count per mapped doc id, built one token at a time.
+ *
+ * Mapped doc ids are dense in [0, N), so lengths live in an array indexed by
+ * id, and tokens may arrive in any document order. Doc ids that never get a
+ * token keep length 0 and are skipped when written.
+ */
+class DocLenCounter {
+public:
+    void add(const unsigned long long doc_id) {
+        if (doc_id >= lengths.size()) lengths.resize(doc_id + 1, 0);
+        ++lengths[doc_id];
+        ++total_frequency;
+    }
+
+    // Documents with at least one token.
+    unsigned long long total_docs() const;
+
+    // Writes doc_len_list.bin and doc_len_meta.bin into out_dir.
+    void write(const std::filesystem::path& out_dir) const;
+
+    std::vector<unsigned int> lengths;
+    unsigned long long total_frequency = 0;
+};
+
+/**
+ * @brief Construct doc_id - doc_len sequence (out_dir/doc_len_list.bin) with
+ * its totals (out_dir/doc_len_meta.bin), from a separate pass over the token
+ * stream. build_index counts during the SPIMI pass instead.
  *
  * Format: (doc_id<vbe_encoding>)(doc_len<unsigned int>)
  *

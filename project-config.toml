@@ -1,28 +1,65 @@
-[data-path]
+# Startorch configuration. startorch.paths reads this file and turns a profile
+# name into every artifact path; nothing else builds data paths by hand.
 
-# both full_corpus and works_subset lives inside data_path
+[paths]
+upstream = "data/parquet"                          # OpenAlex snapshot prefix on S3
+data-root = "/data/scholar_rank/data"              # holds tmp/, full_corpus/, works_subset/
+index-root = "/data/scholar_rank/posting"          # one index folder per profile, unless the profile sets index-root
+benchmark-root = "/data/scholar_rank/benchmark"    # benchmark results: <benchmark-root>/<profile>/query_result
+query-root = "/data/scholar_rank/benchmark/data"   # query sets: <query-root>/<profile>
+spill = "/data/scholar_rank/data/spill"            # DuckDB spill directory
 
-upstream-path = "data/parquet"
-data-path = "/data/scholar_rank/data"          # Storing compacted shards after extraction
-posting-path = "/data/scholar_rank/posting"              # Store posting data
-tmp-corpus-folder = "tmp"
-full-corpus-folder = "full_corpus"
-works-subset-folder = "works_subset"
+[folders]
+tmp-corpus = "tmp"
+full-corpus = "full_corpus"
+works-subset = "works_subset"
+lookup = "lookup"
+token-stream = "token_stream"
+posting = "posting"
+partial = "posting/partial"
+query-result = "query_result"
 
-[works-subset.subset-profiles]
-"math-en" = "topics[1].field_display_name = 'Mathematics' AND language = 'en'"
-"engr-en" = "topics[1].field_display_name = 'Engineering' AND language = 'en'"
-"vet-en" = "topics[1].field_display_name = 'Veterinary' AND language = 'en'"
-"cs-en" = "topics[1].field_display_name = 'Computer Science' AND language = 'en'"
-"full-en" = "language = 'en'"
-"full-en-2" = "language = 'en'"
+[files]
+lookup = "doc_id_lookup.bin"
 
-[duckdb]
-"spill-path" = "/data/scholar_rank/data/spill"
+# One table per profile.
+#   kind         "openalex" (a filter over the Works corpus) or "msmarco".
+#   filter       OpenAlex only: the DuckDB condition selecting the profile's works.
+#   materialize  OpenAlex only: copy matching works into works_subset/<profile>
+#                (small dev subsets), or read the corpus through the filter
+#                (large profiles, where a copy saves little: see docs/refractor.md).
+#   k1, b, block-size, split-size, mem-limit
+#                Index build parameters. Any left out take BuildParams' defaults
+#                (cpp/include/startorch/retrieval/build_params.h).
 
-[posting]
-"lookup-folder" = "lookup"
-"lookup-file-name" = "doc_id_lookup.bin"
-"token-stream-folder" = "token_stream"
-"posting-folder" = "posting"
-"partial-folder" = "posting/partial"
+[profiles.math-en]
+kind = "openalex"
+filter = "topics[1].field_display_name = 'Mathematics' AND language = 'en'"
+materialize = true
+
+[profiles.engr-en]
+kind = "openalex"
+filter = "topics[1].field_display_name = 'Engineering' AND language = 'en'"
+materialize = true
+
+[profiles.vet-en]
+kind = "openalex"
+filter = "topics[1].field_display_name = 'Veterinary' AND language = 'en'"
+materialize = true
+
+[profiles.cs-en]
+kind = "openalex"
+filter = "topics[1].field_display_name = 'Computer Science' AND language = 'en'"
+materialize = true
+
+[profiles.full-en]
+kind = "openalex"
+filter = "language = 'en'"
+materialize = false
+
+[profiles.msmarco]
+kind = "msmarco"
+collection = "/data/scholar_rank/benchmark/data/msmarco/collection.tsv"
+index-root = "/data/scholar_rank/benchmark/msmarco"   # where the MS MARCO index already lives
+k1 = 0.82                                             # Anserini's MS MARCO passage setting
+b = 0.68

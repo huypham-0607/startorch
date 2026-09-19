@@ -97,7 +97,7 @@ def _():
     assert s.rows_per_chunk == 2000000
 
 
-@check("project-config.toml's subset-profiles are all valid DuckDB boolean expressions")
+@check("project-config.toml's OpenAlex profile filters are all valid DuckDB boolean expressions")
 def _():
     # Doesn't touch real corpus data - builds a single synthetic row shaped like a
     # compact Works record (nested topics struct + language) and evaluates each
@@ -106,13 +106,11 @@ def _():
     # validate_database(). Catches SQL typos/invalid syntax in project-config.toml
     # without needing a real subset on disk.
     import duckdb
-    import tomllib
+    from startorch.paths import profile, profile_names
+    from startorch.utils import fetch_one
 
-    with open(REPO_ROOT / "project-config.toml", "rb") as f:
-        config = tomllib.load(f)
-
-    profiles = config["works-subset"]["subset-profiles"]
-    assert len(profiles) > 0, "no subset-profiles defined"
+    profiles = {name: profile(name).filter for name in profile_names("openalex")}
+    assert len(profiles) > 0, "no OpenAlex profiles defined"
 
     con = duckdb.connect()
     con.sql("""
@@ -121,7 +119,7 @@ def _():
             'en' AS language
     """)
     for name, condition in profiles.items():
-        result = con.sql(f"SELECT ({condition}) AS matches_filter FROM _probe").fetchone()[0]
+        result = fetch_one(con.sql(f"SELECT ({condition}) AS matches_filter FROM _probe"))[0]
         assert result in (True, False), f"profile {name!r} condition did not evaluate to a boolean: {result!r}"
 
 
@@ -152,20 +150,93 @@ def _():
     _run_cli_help(["gen-works-subset"])
 
 
-@check("CLI gen-works-subset --profile choices match project-config.toml exactly")
+@check("CLI --help: build-posting")
 def _():
-    import tomllib
-    with open(REPO_ROOT / "project-config.toml", "rb") as f:
-        config = tomllib.load(f)
-    expected = set(config["works-subset"]["subset-profiles"].keys())
+    _run_cli_help(["build-posting"])
 
+
+@check("CLI --help: query")
+def _():
+    _run_cli_help(["query"])
+
+
+def _help_choices(subcommand):
+    """The --profile choices a subcommand's --help lists, e.g. {cs-en,full-en}."""
+    import re
     proc = subprocess.run(
-        [PYTHON_EXE, "-m", "startorch.cli", "gen-works-subset", "--help"],
+        [PYTHON_EXE, "-m", "startorch.cli", subcommand, "--help"],
         cwd=str(PYTHON_SRC), capture_output=True, text=True, timeout=30,
     )
     assert proc.returncode == 0, proc.stderr
-    for name in expected:
-        assert name in proc.stdout, f"profile {name!r} missing from --help output:\n{proc.stdout}"
+    match = re.search(r"--profile \{([^}]*)\}", proc.stdout)
+    assert match, proc.stdout
+    return set(match.group(1).split(","))
+
+
+@check("CLI --profile choices match project-config.toml exactly")
+def _():
+    from startorch.paths import profile_names
+    assert _help_choices("gen-works-subset") == set(profile_names("openalex"))
+    assert _help_choices("build-posting") == set(profile_names())
+    assert _help_choices("query") == set(profile_names())
+
+
+@check("profile() resolves every artifact to the paths the data already uses")
+def _():
+    # Golden paths: where the indexes, query sets and results live on disk
+    # today. A config or paths.py change that moves any of them fails here.
+    from startorch.paths import profile
+    expected = {
+        ("full-en", "meta_path"): "/data/scholar_rank/posting/full-en/posting/metadata.bin",
+        ("full-en", "lookup_file"): "/data/scholar_rank/posting/full-en/lookup/doc_id_lookup.bin",
+        ("full-en", "token_dir"): "/data/scholar_rank/posting/full-en/token_stream",
+        ("full-en", "partial_dir"): "/data/scholar_rank/posting/full-en/posting/partial",
+        ("full-en", "query_dir"): "/data/scholar_rank/benchmark/data/full-en",
+        ("full-en", "result_dir"): "/data/scholar_rank/benchmark/full-en/query_result",
+        ("math-en", "subset_dir"): "/data/scholar_rank/data/works_subset/math-en",
+        ("msmarco", "meta_path"): "/data/scholar_rank/benchmark/msmarco/posting/metadata.bin",
+        ("msmarco", "token_dir"): "/data/scholar_rank/benchmark/msmarco/token_stream",
+        ("msmarco", "query_dir"): "/data/scholar_rank/benchmark/data/msmarco",
+        ("msmarco", "result_dir"): "/data/scholar_rank/benchmark/msmarco/query_result",
+        ("msmarco", "collection"): "/data/scholar_rank/benchmark/data/msmarco/collection.tsv",
+    }
+    for (name, attr), path in expected.items():
+        got = str(getattr(profile(name), attr))
+        assert got == path, f"profile({name!r}).{attr} = {got}, expected {path}"
+    assert profile("msmarco").build_params == {"k1": 0.82, "b": 0.68}
+    assert not profile("full-en").materialize and profile("math-en").materialize
+
+
+@check("build_index rejects out-of-range BuildParams before reading anything")
+def _():
+    from startorch import startorch_cpp
+    missing = REPO_ROOT / "python" / ".tmp" / "smoke_missing"
+    try:
+        startorch_cpp.build_index(missing / "tokens", missing / "partial", missing / "out", k1=0.0)
+        raise AssertionError("k1 = 0 was accepted")
+    except ValueError:
+        pass
+    assert not (missing / "out").exists(), "nothing may be created for invalid parameters"
+
+
+@check("DocIdLookup round-trips raw ids <-> mapped ids")
+def _():
+    import tempfile
+    import numpy as np
+    from startorch.doc_id_lookup import DocIdLookup, lookup_records
+    raw = np.array([3, 17, 42, 1000, 2**40], dtype=np.int64)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "doc_id_lookup.bin"
+        path.write_bytes(lookup_records(raw, 0).tobytes())
+        lookup = DocIdLookup(path)
+        assert len(lookup) == len(raw)
+        assert lookup.raw_ids([4, 0, 2]).tolist() == [2**40, 3, 42]
+        assert lookup.mapped_ids([42, 3]).tolist() == [2, 0]
+        try:
+            lookup.mapped_ids([5])
+            raise AssertionError("an unknown raw id was mapped")
+        except KeyError:
+            pass
 
 
 print()

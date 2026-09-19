@@ -3,13 +3,15 @@
 #include <pybind11/stl/filesystem.h>
 #include <pybind11/chrono.h>
 #include "startorch/retrieval/query_engine.h"
-#include "startorch/retrieval/construct_doc_len_list.h"
-#include "startorch/retrieval/construct_inverted_blocks.h"
+#include "startorch/retrieval/build_index.h"
+#include "startorch/retrieval/build_params.h"
 #include "startorch/retrieval/merge_inverted_blocks.h"
 #include "startorch/retrieval/file_names.h"
 
 namespace py = pybind11;
 
+// Python type checkers read python/src/startorch/_native/startorch_cpp.pyi, not
+// this module. Keep that stub in sync with every change here.
 PYBIND11_MODULE(startorch_cpp, m) {
     auto fn = m.def_submodule("file_names", "Centralized on-disk naming convention.");
     fn.attr("BLOCK_META") = file_names::BLOCK_META;
@@ -20,27 +22,29 @@ PYBIND11_MODULE(startorch_cpp, m) {
     fn.def("posting_file_name", &file_names::posting_file_name, py::arg("file_index"));
     fn.def("partial_block_file_name", &file_names::partial_block_file_name, py::arg("block_index"));
 
+    // Keyword defaults come from BuildParams, the only place they live.
+    const BuildParams defaults;
     m.def(
-        "build_doc_len",
-        &construct_doc_len_list,
-        py::arg("in_dir"), py::arg("out_dir"),
-        "Construct document length list to support BM25 score computation."
-    );
-
-    m.def(
-        "build_inverted_blocks",
-        &construct_inverted_blocks,
-        py::arg("in_dir"), py::arg("out_dir"), py::arg("mem_limit"),
-        "Construct SPIMI partial inverted index blocks."
-    );
-
-    m.def(
-        "merge_inverted_blocks",
-        &merge_inverted_blocks,
-        py::arg("in_dir"), py::arg("out_dir"),
-        py::arg("k1"), py::arg("b"), py::arg("block_size"), py::arg("split_size"),
-        "Merge partial inverted index blocks into complete posting lists. "
-        "out_dir must already contain doc_len_list.bin and doc_len_meta.bin."
+        "build_index",
+        [](const fs::path& token_dir, const fs::path& partial_dir, const fs::path& out_dir,
+           float k1, float b, int block_size, size_t split_size, size_t mem_limit) {
+            BuildParams params;
+            params.k1 = k1;
+            params.b = b;
+            params.block_size = block_size;
+            params.split_size = split_size;
+            params.mem_limit = mem_limit;
+            build_index(token_dir, partial_dir, out_dir, params);
+        },
+        py::arg("token_dir"), py::arg("partial_dir"), py::arg("out_dir"),
+        py::arg("k1") = defaults.k1, py::arg("b") = defaults.b,
+        py::arg("block_size") = defaults.block_size, py::arg("split_size") = defaults.split_size,
+        py::arg("mem_limit") = defaults.mem_limit,
+        "Build a complete index from token_dir's token_*.bin files, reading them once: "
+        "SPIMI partial blocks go to partial_dir (leftover ones are removed first), "
+        "document lengths are counted in the same pass, and the merged index is "
+        "written to out_dir. Parameters are validated first; an out-of-range value "
+        "raises ValueError."
     );
 
     py::class_<QueryEngine>(

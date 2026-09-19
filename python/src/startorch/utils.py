@@ -1,6 +1,5 @@
 import logging
 import sys
-import tomllib
 
 from datetime import datetime
 from pathlib import Path
@@ -29,13 +28,14 @@ def get_current_time() -> str:
     formatted_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z %z")
     return formatted_time
 
-def load_config() -> dict:
-    CONFIG_PATH = PROJECT_ROOT / "project-config.toml"
+def fetch_one(result) -> tuple:
+    """First row of a DuckDB query that always returns one, such as count(*).
 
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+    DuckDB's fetchone() returns None when there are no rows; this raises
+    instead, so callers can index the row directly.
+    """
+    row = result.fetchone()
+    if row is None:
+        raise RuntimeError("Query returned no rows.")
+    return row
 
-def load_benchmark_config() -> dict:
-    config_path = PROJECT_ROOT / "python" / "benchmark" / "benchmark-config.toml"
-    with open(config_path, "rb") as f:
-        return tomllib.load(f)

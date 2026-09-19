@@ -5,13 +5,11 @@ import numpy as np
 import pandas as pd
 
 from pathlib import Path
-from startorch import load_benchmark_config
+from startorch import profile
 
-benchmark_config = load_benchmark_config()
-
-msmarco_bench_path = Path(benchmark_config["msmarco"]["posting-dir"]) / "query_result" / "perf_raw.parquet"
-openalex_bench_path = Path(benchmark_config["paths"]["benchmark-dir"]) / "full-en" / "query_result" / "perf_raw.parquet"
-correctness_bench_path = Path(benchmark_config["paths"]["benchmark-dir"]) / "full-en" / "query_result" / "correctness_raw.parquet"
+msmarco_bench_path = profile("msmarco").result_dir / "perf_raw.parquet"
+openalex_bench_path = profile("full-en").result_dir / "perf_raw.parquet"
+correctness_bench_path = profile("full-en").result_dir / "correctness_raw.parquet"
 
 msmarco_bench = pd.read_parquet(msmarco_bench_path)
 openalex_bench = pd.read_parquet(openalex_bench_path)

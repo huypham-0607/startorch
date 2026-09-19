@@ -23,6 +23,7 @@
 #include <functional>
 #include <queue>
 #include <chrono>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -195,48 +196,28 @@ size_t PostingPointer::read_posting_entry(
     unsigned long long &delta,
     unsigned int &freq
 ) const {
-    // Read VBE encoding
-    int idx = 0;
-    unsigned char buffer[BUFFER_LIMIT];
-    while (idx < BUFFER_LIMIT) {
-        buffer[idx] = (*posting_file)[cur_addr + idx];
-        if (buffer[idx] >= 128) {
-            break;
-        }
-        ++idx;
+    const size_t file_size = posting_file->size();
+    if (cur_addr >= file_size) {
+        throw std::runtime_error(std::format(
+            "Unable to read VBE Encoding in posting {}: address {} is past the end of the file.",
+            term, cur_addr
+        ));
     }
+    const unsigned char* entry = posting_file->data() + cur_addr;
+    const size_t available = file_size - cur_addr;
 
-    // VBE overflow
-    if (idx == BUFFER_LIMIT) {
+    // Throws on a value with no terminator within BUFFER_LIMIT bytes.
+    const size_t vbe_size = vbe_decode_from(entry, available, delta);
+    if (vbe_size == 0 || available - vbe_size < sizeof(freq)) {
         throw std::runtime_error(std::format(
             "Unable to read VBE Encoding in posting {}.",
             term
         ));
     }
-    size_t vbe_size = idx + 1;
 
-    try {
-        delta = vbe_decode(buffer);
-    }
-    catch (const std::runtime_error&) {
-        throw std::runtime_error(std::format(
-            "Unable to convert VBE Encoding into 'unsigned long long' in posting {}.",
-            term
-        ));
-    }
-
-    // Reading frequency
-    for (size_t i = 0; i < sizeof(unsigned int); i++) {
-        buffer[i] = (*posting_file)[cur_addr + vbe_size + i];
-    }
-    if constexpr (std::endian::native == std::endian::big) {
-        std::reverse(buffer, buffer + sizeof(unsigned int));
-    }
-    freq = 0;
-    for (size_t i = 0; i < sizeof(unsigned int); i++) {
-        freq += static_cast<unsigned int>(buffer[i]) * (1<<(8*i));
-    }
-    return vbe_size + sizeof(unsigned int);
+    // freq was written in native byte order (BufferedWriter::fwrite).
+    std::memcpy(&freq, entry + vbe_size, sizeof(freq));
+    return vbe_size + sizeof(freq);
 }
 
 void sort_posting(std::vector<PostingPointer>& postings) {

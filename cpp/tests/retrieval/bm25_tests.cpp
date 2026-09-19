@@ -1,4 +1,5 @@
 #include "startorch/retrieval/bm25.h"
+#include "startorch/retrieval/build_params.h"
 
 #include <cmath>
 #include <gtest/gtest.h>
@@ -85,7 +86,8 @@ TEST(BM25IdfTest, ExactAtCorpusScale) {
 TEST(CalcBM25Test, ScoreStaysPositiveWhenTermInEveryDocument) {
     // df_t == N still carries a small positive IDF, so the score is
     // positive rather than zero.
-    float score = calc_BM25(/*N=*/100, /*df_t=*/100, /*tf=*/50.0f, /*doc_len=*/3.0f, /*avgdl=*/10.0f);
+    const BuildParams params;
+    float score = calc_BM25(/*N=*/100, /*df_t=*/100, /*tf=*/50.0f, /*doc_len=*/3.0f, /*avgdl=*/10.0f, params.k1, params.b);
     ASSERT_GT(score, 0.0f);
 }
 
@@ -102,8 +104,9 @@ TEST(CalcBM25Test, EqualsIdfTimesSaturation) {
 
 TEST(CalcBM25Test, RarerTermsScoreHigherAllElseEqual) {
     float tf = 2.0f, doc_len = 8.0f, avgdl = 8.0f;
-    float common = calc_BM25(/*N=*/1000, /*df_t=*/500, tf, doc_len, avgdl);
-    float rare = calc_BM25(/*N=*/1000, /*df_t=*/5, tf, doc_len, avgdl);
+    const BuildParams params;
+    float common = calc_BM25(/*N=*/1000, /*df_t=*/500, tf, doc_len, avgdl, params.k1, params.b);
+    float rare = calc_BM25(/*N=*/1000, /*df_t=*/5, tf, doc_len, avgdl, params.k1, params.b);
 
     ASSERT_GT(rare, common);
 }

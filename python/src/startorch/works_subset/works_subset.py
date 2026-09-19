@@ -1,14 +1,16 @@
 """Makes a smaller Works subset from the full corpus, for development and testing.
 
-Driven by the CLI (startorch gen-works-subset) and project-config.toml.
+Driven by the CLI (startorch gen-works-subset) and project-config.toml. Only
+profiles with materialize = true are copied; the rest are read straight from
+the corpus through their filter (see startorch.tokenizer.profile_source).
 """
 
+import sys
+
 import duckdb as db
-import math
-import tomllib
 
 from pathlib import Path
-from startorch import get_logger, get_current_time, PROJECT_ROOT
+from startorch.utils import fetch_one, get_current_time, get_logger
 
 logger = get_logger(__name__)
 
@@ -37,78 +39,55 @@ class WorksSubsetter:
 
         logger.info("Finished initializing WorksSubsetter.")
 
-    def validate_database(self):
-        """Checks subset_path against full_corpus_path: filter match, duplicate IDs, link counts.
+    def _corpus_glob(self) -> str:
+        return f"{self.full_corpus_path}/works/**/*.parquet"
 
-        Writes database_validation_log.txt under subset_path. Every check is a SQL
-        aggregate/count query - no per-row Python loop, no full id set held in memory.
-        The straightforward per-row version OOMs at full-corpus scale (hundreds of
-        millions of ids held twice over, once as full-corpus matches and once as
-        subset-present, plus a growing error-message list) - this trades per-row detail
-        for counts only, computed inside DuckDB's own (spill-configured) engine instead.
+    def count_matching(self) -> int:
+        """Works in the full corpus matching the filter. Reads only the filter's columns."""
+        con = db.connect(config={"temp_directory": str(self.spill_path)})
+        return fetch_one(con.sql(f"""
+            SELECT count(*) FROM read_parquet('{self._corpus_glob()}') WHERE {self.filter_condition}
+        """))[0]
+
+    def validate_database(self):
+        """Checks subset_path against the corpus: every row matches the filter,
+        ids are unique, and no matching work is missing.
+
+        Writes database_validation_log.txt under subset_path. Two queries:
+
+        - one scan of the subset: row count, distinct ids (parsed to BIGINT, so
+          the hash table holds 8-byte keys rather than strings), filter mismatches;
+        - the corpus's filtered row count, which reads only the filter's columns.
+
+        Missing entries = corpus count - subset rows. That is exact: the subset
+        was copied from the corpus, its ids are distinct, and every row matches
+        the filter, so equal counts mean equal sets.
         """
         con = db.connect(config={"temp_directory": str(self.spill_path)})
 
         logger.info("Begin validating Database")
 
-        logger.info("Checking total nodes/links, filter mismatches, link-count mismatches...")
-        total_nodes, total_links, filter_mismatch_count, link_mismatch_count = con.sql(f"""
+        logger.info("Checking total nodes, duplicate ids, filter mismatches...")
+        total_rows, total_nodes, total_links, filter_mismatch_count = fetch_one(con.sql(f"""
             SELECT
-                count(DISTINCT id) AS total_nodes,
-                sum(referenced_works_count) AS total_links,
-                count(*) FILTER (WHERE NOT matches_filter) AS filter_mismatch_count,
-                count(*) FILTER (
-                    WHERE referenced_works_count IS DISTINCT FROM len(referenced_works)
-                ) AS link_mismatch_count
-            FROM (
-                SELECT
-                    id, referenced_works, referenced_works_count,
-                    ({self.filter_condition}) AS matches_filter
-                FROM read_parquet('{str(self.subset_path)}/**/*.parquet')
-            )
-        """).fetchone()
-
-        logger.info("Checking duplicate ids...")
-        duplicate_id_count = con.sql(f"""
-            SELECT count(*) FROM (
-                SELECT id
-                FROM read_parquet('{str(self.subset_path)}/**/*.parquet')
-                GROUP BY id
-                HAVING count(*) > 1
-            )
-        """).fetchone()[0]
+                count(*),
+                count(DISTINCT regexp_replace(id, 'W', '')::BIGINT),
+                sum(referenced_works_count),
+                count(*) FILTER (WHERE NOT ({self.filter_condition}))
+            FROM read_parquet('{str(self.subset_path)}/**/*.parquet')
+        """))
+        duplicate_id_count = total_rows - total_nodes
 
         logger.info("Checking for full-corpus entries missing from subset...")
-        missing_entry_count = con.sql(f"""
-            SELECT count(*)
-            FROM (
-                SELECT id
-                FROM read_parquet('{self.full_corpus_path}/works/**/*.parquet')
-                WHERE {self.filter_condition}
-            ) f
-            ANTI JOIN read_parquet('{str(self.subset_path)}/**/*.parquet') s ON f.id = s.id
-        """).fetchone()[0]
+        missing_entry_count = self.count_matching() - (total_rows - filter_mismatch_count)
 
-        logger.info("Checking dangling references (pointing outside the subset)...")
-        dangling_links = con.sql(f"""
-            SELECT count(*)
-            FROM (
-                SELECT unnest(referenced_works) AS ref
-                FROM read_parquet('{str(self.subset_path)}/**/*.parquet')
-            ) w
-            ANTI JOIN read_parquet('{str(self.subset_path)}/**/*.parquet') s ON s.id = w.ref
-        """).fetchone()[0]
-
-        total_errors = filter_mismatch_count + duplicate_id_count + link_mismatch_count + missing_entry_count
+        total_errors = filter_mismatch_count + duplicate_id_count + missing_entry_count
 
         logger.info("Finished validating Database")
         logger.info(f"Total nodes: {total_nodes}.")
         logger.info(f"Total links: {total_links}.")
-        logger.info(f"Total dangling links: {dangling_links}.")
-        logger.info(f"Total valid links: {total_links - dangling_links}.")
         logger.info(f"Filter mismatches: {filter_mismatch_count}.")
         logger.info(f"Duplicate ids: {duplicate_id_count}.")
-        logger.info(f"Link count mismatches: {link_mismatch_count}.")
         logger.info(f"Missing entries (in full corpus, not in subset): {missing_entry_count}.")
         logger.info(f"Total errors: {total_errors}.")
 
@@ -117,11 +96,8 @@ class WorksSubsetter:
                 f.write(f"Time created: {get_current_time()}.\n")
                 f.write(f"Total nodes: {total_nodes}.\n")
                 f.write(f"Total links: {total_links}.\n")
-                f.write(f"Total dangling links: {dangling_links}.\n")
-                f.write(f"Total valid links: {total_links - dangling_links}.\n")
                 f.write(f"Filter mismatches: {filter_mismatch_count}.\n")
                 f.write(f"Duplicate ids: {duplicate_id_count}.\n")
-                f.write(f"Link count mismatches: {link_mismatch_count}.\n")
                 f.write(f"Missing entries (in full corpus, not in subset): {missing_entry_count}.\n")
                 f.write(f"Total errors: {total_errors}.\n")
         except Exception as e:
@@ -134,6 +110,10 @@ class WorksSubsetter:
         self.subset_path.mkdir(parents=True, exist_ok=True)
 
         con = db.connect(config={"temp_directory": str(self.spill_path)})
+        # Row order doesn't matter to anything downstream (the tokenizer and
+        # the C++ build accept any order), so let the scan threads write
+        # without buffering batches to keep file order.
+        con.execute("SET preserve_insertion_order = false")
         logger.info("Established connection to DB")
 
         logger.info("Started fetching subset.")
@@ -144,7 +124,7 @@ class WorksSubsetter:
         n_rows = con.execute(f"""
             COPY (
                 SELECT *
-                FROM read_parquet('{self.full_corpus_path}/works/**/*.parquet')
+                FROM read_parquet('{self._corpus_glob()}')
                 WHERE {self.filter_condition}
             )
             TO '{str(self.subset_path)}'
@@ -161,27 +141,18 @@ class WorksSubsetter:
         logger.info("Subset saved")
 
 
-def _resolve(raw: str) -> Path:
-    p = Path(raw)
-    return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-
-
 def main():
-    """Dev entry point: runs validate_database() only, against the full-en profile.
+    """Dev entry point: validate one copied profile's existing subset.
 
-    Assumes the full-en subset already exists at its configured path.
+    python -m startorch.works_subset.works_subset [profile]   (default math-en)
     """
-    with open(PROJECT_ROOT / "project-config.toml", "rb") as f:
-        config = tomllib.load(f)
+    from startorch.paths import corpus_paths, profile
 
-    paths = config["data-path"]
-    data_path = _resolve(paths["data-path"])
-    full_corpus_path = data_path / paths["full-corpus-folder"]
-    subset_path = data_path / paths["works-subset-folder"] / "full-en"
-    spill_path = _resolve(config["duckdb"]["spill-path"])
-    condition = config["works-subset"]["subset-profiles"]["full-en"]
-
-    subsetter = WorksSubsetter(full_corpus_path, subset_path, spill_path, condition)
+    p = profile(sys.argv[1] if len(sys.argv) > 1 else "math-en")
+    if not p.materialize:
+        raise SystemExit(f"Profile {p.name} is not copied into a subset; nothing to validate.")
+    assert p.subset_dir is not None and p.filter is not None, f"{p.name} is not an OpenAlex profile"
+    subsetter = WorksSubsetter(corpus_paths().compact, p.subset_dir, p.spill_dir, p.filter)
     subsetter.validate_database()
 
 if __name__ == "__main__":

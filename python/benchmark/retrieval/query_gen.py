@@ -5,12 +5,10 @@ import numpy as np
 import pandas as pd
 
 from pathlib import Path
-from startorch import get_logger, load_config, load_benchmark_config, startorch_cpp
-from ms_marco_pipeline import build_posting, run_queries_perf_metrics
+from startorch import get_logger, profile, startorch_cpp
 
 logger = get_logger(__name__)
 
-QUERY_RESULT_FOLDER = "query_result"
 
 SEED = 67
 N_QUERIES = 2000
@@ -204,13 +202,9 @@ def main():
         - skewed_set.tsv: Random terms with top 0.01% highest df or top 0.01% lowest df.
         - weighted_set.tsv: Random terms with (df / sum(df)) chance of appearing..
     """
-    config = load_config()
-    benchmark_config = load_benchmark_config()
-
-    paths = config["data-path"]
-
-    full_meta_path = Path(paths["posting-path"]) / "full-en" / config["posting"]["posting-folder"] / "metadata.bin"
-    query_data_dir = Path(benchmark_config["paths"]["data-dir"]) / "full-en"
+    full_en = profile("full-en")
+    full_meta_path = full_en.meta_path
+    query_data_dir = full_en.query_dir
     query_data_dir.mkdir(parents=True, exist_ok=True)
 
     # flag = True

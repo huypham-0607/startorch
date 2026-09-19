@@ -1,92 +1,54 @@
 """
     Supports 4 commands:
-        - fetch_data
-        - subset
-        - build_posting (which also includes tokenizer)
+        - ingest
+        - gen-works-subset
+        - build-posting (tokenizer + C++ index build)
         - query
-    
+
+    Every path and build parameter comes from project-config.toml through
+    startorch.paths; this module only parses arguments and dispatches.
 """
 
 import argparse
-import tomllib
 
-from pathlib import Path
-from startorch import EntityIngestor, WorksSubsetter, PROJECT_ROOT, get_logger, PostingBuildler, retrieve
+from startorch import (
+    EntityIngestor, PostingBuilder, Searcher, WorksSubsetter,
+    corpus_paths, get_logger, profile, profile_names,
+)
 
 logger = get_logger(__name__)
-CONFIG_PATH = PROJECT_ROOT / "project-config.toml"
 
-def load_config() -> dict:
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
-
-def resolve_path(raw: str) -> Path:
-    p = Path(raw)
-    return p if p.is_absolute() else (PROJECT_ROOT / p).resolve()
-
-def get_profile_data_path(profile: str, config: dict) -> Path:
-    paths = config["data-path"]
-    return (
-        resolve_path(paths["data-path"]) / paths["full-corpus-folder"] if (profile == "full-corpus")
-        else resolve_path(paths["data-path"]) / paths["works-subset-folder"] / profile
-    )
-
-def get_profile_posting_path(profile: str, config: dict) -> Path:
-    paths = config["data-path"]
-    return resolve_path(paths["posting-path"]) / profile
-
-def cmd_ingest(args: argparse.Namespace, config: dict) -> None:
-    paths = config["data-path"]
+def cmd_ingest(args: argparse.Namespace) -> None:
+    corpus = corpus_paths()
     ingestor_cls = EntityIngestor.registry[args.entity]
     ingestor = ingestor_cls(
-        upstream_prefix=Path(paths["upstream-path"]),
-        raw_path=resolve_path(paths["data-path"]) / paths["tmp-corpus-folder"],
-        compact_path=resolve_path(paths["data-path"]) / paths["full-corpus-folder"],
+        upstream_prefix=corpus.upstream,
+        raw_path=corpus.raw,
+        compact_path=corpus.compact,
     )
     ingestor.orchestrate(forced_fetch=args.forced_fetch)
 
-def cmd_gen_works_subset(args: argparse.Namespace, config: dict) -> None:
-    paths = config["data-path"]
-    full_corpus_path = get_profile_data_path("full-corpus", config)
-    subset_path = get_profile_data_path(args.profile, config)
-    spill_path = resolve_path(config["duckdb"]["spill-path"])
-    condition = config["works-subset"]["subset-profiles"][args.profile]
-    subsetter = WorksSubsetter(full_corpus_path, subset_path, spill_path, condition)
+def cmd_gen_works_subset(args: argparse.Namespace) -> None:
+    p = profile(args.profile)
+    # argparse only offers OpenAlex profiles here, and they always have both.
+    assert p.subset_dir is not None and p.filter is not None, f"{p.name} is not an OpenAlex profile"
+    subsetter = WorksSubsetter(corpus_paths().compact, p.subset_dir, p.spill_dir, p.filter)
+    if not p.materialize:
+        n_works = subsetter.count_matching()
+        logger.info(f"Profile {p.name} reads the corpus through its filter ({n_works} works); nothing to copy.")
+        return
     subsetter.subset_database()
     subsetter.validate_database()
 
-def cmd_build_posting(args: argparse.Namespace, config: dict) -> None:
-    corpus_path = get_profile_data_path(args.profile, config)
-    out_path = get_profile_posting_path(args.profile, config)
-    spill_path = resolve_path(config["duckdb"]["spill-path"])
-    posting_config = config["posting"]
-    posting_builder = PostingBuildler(
-        corpus_path,
-        out_path,
-        spill_path,
-        posting_config["lookup-folder"],
-        posting_config["lookup-file-name"],
-        posting_config["token-stream-folder"],
-        posting_config["posting-folder"],
-        posting_config["partial-folder"],
-    )
-    posting_builder.build()
+def cmd_build_posting(args: argparse.Namespace) -> None:
+    PostingBuilder(profile(args.profile)).build()
 
-def cmd_query(args: argparse.Namespace, config: dict) -> None:
-    root_path = get_profile_posting_path(args.profile, config)
-    posting_folder = config["posting"]["posting-folder"] 
-    lookup_folder = config["posting"]["lookup-folder"] 
-    lookup_file_name = config["posting"]["lookup-file-name"] 
-    retrieve(
-        args.query,
-        args.k,
-        root_path,
-        posting_folder,
-        lookup_folder,
-        lookup_file_name
-    )
+def cmd_query(args: argparse.Namespace) -> None:
+    result = Searcher(profile(args.profile)).search(args.query, args.k)
+    for doc_id, score in result.hits:
+        print(f"{doc_id} {score}")
 
-def build_parser(config: dict) -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="startorch")
     subparsers = parser.add_subparsers(dest="command", required = True)
 
@@ -110,8 +72,9 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
     gen_works_subset_parser.add_argument(
         "--profile",
         required=True,
-        choices=sorted(config["works-subset"]["subset-profiles"]),
-        help="Subset profile to use (see project-config.toml for filter conditions)."
+        choices=profile_names("openalex"),
+        help="OpenAlex profile to use (see project-config.toml for filter conditions). "
+             "Profiles with materialize = false are only counted, not copied."
     )
     gen_works_subset_parser.set_defaults(func=cmd_gen_works_subset)
 
@@ -120,8 +83,8 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
     build_posting_parser.add_argument(
         "--profile",
         required=True,
-        choices=sorted(config["works-subset"]["subset-profiles"]),
-        help="Subset profile to use (see project-config.toml for filter conditions), has to be generated first."
+        choices=profile_names(),
+        help="Profile to build (see project-config.toml). Copied OpenAlex profiles need gen-works-subset first."
     )
     build_posting_parser.set_defaults(func=cmd_build_posting)
 
@@ -141,8 +104,8 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
     query_parser.add_argument(
         "--profile",
         default="full-en",
-        choices=sorted(config["works-subset"]["subset-profiles"]),
-        help="Subset profile to query (Defaults to full-en)."
+        choices=profile_names(),
+        help="Profile to query (Defaults to full-en)."
     )
     query_parser.set_defaults(func=cmd_query)
 
@@ -150,10 +113,9 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
 
 
 def main():
-    config = load_config()
-    parser = build_parser(config)
+    parser = build_parser()
     args = parser.parse_args()
-    args.func(args, config)
+    args.func(args)
 
 
 if __name__ == "__main__":

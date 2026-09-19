@@ -1,6 +1,8 @@
 #ifndef MERGE_INVERTED_BLOCKS_H
 #define MERGE_INVERTED_BLOCKS_H
 
+#include "startorch/retrieval/build_params.h"
+
 #include <filesystem>
 #include <string>
 #include <utility>
@@ -59,48 +61,70 @@ struct TermMeta {
 /**
  * @brief Merge partial SPIMI blocks (construct_inverted_blocks output) into
  * a small, fixed number of final posting-data files plus one consolidated
- * BMW block-metadata file (out_dir / "block_meta.bin").
+ * BMW block-metadata file (out_dir / "block_meta.bin"), then metadata.
  *
- * Expects out_dir to already contain doc_len_list.bin and doc_len_meta.bin
- * (construct_doc_len_list output, written to the same directory) - their
- * paths are derived internally from out_dir, not passed in.
+ * Document lengths come in as arguments. build_index passes the lengths it
+ * counted during the SPIMI pass; merge_inverted_blocks loads them from files.
  *
  * @param in_dir directory containing partial block_*.bin files
- * @param out_dir directory containing doc_len_list.bin/doc_len_meta.bin,
- * and to write posting_*.bin + block_meta.bin into
- * @param k1 BM25 k1 parameter
- * @param b BM25 b parameter
- * @param block_size number of postings per BMW block
- * @param split_size approximate max bytes per posting_*.bin output file
+ * @param out_dir directory to write posting_*.bin, block_meta.bin and
+ * metadata into
+ * @param doc_len_list doc_id -> token count; its size is N
+ * @param total_docs documents with at least one token
+ * @param total_frequency tokens over all documents
+ * @param params k1, b, block_size and split_size are used; validated here
+ */
+void merge_partial_blocks(
+    const std::filesystem::path& in_dir,
+    const std::filesystem::path& out_dir,
+    const std::vector<unsigned int>& doc_len_list,
+    const unsigned long long total_docs,
+    const unsigned long long total_frequency,
+    const BuildParams& params
+);
+
+/**
+ * @brief merge_partial_blocks with document lengths loaded from
+ * out_dir/doc_len_list.bin and out_dir/doc_len_meta.bin (construct_doc_len_list
+ * output). For the standalone app and tests; the Python build uses build_index.
  */
 void merge_inverted_blocks(
     const std::filesystem::path& in_dir,
     const std::filesystem::path& out_dir,
-    const float k1 = 1.2f,
-    const float b = 0.75f,
-    const int block_size = 128,
-    const size_t split_size = (1ull << 30)
+    const BuildParams& params = {}
+);
+
+// Positional form of the above, kept for existing callers. No defaults here:
+// they live in BuildParams.
+void merge_inverted_blocks(
+    const std::filesystem::path& in_dir,
+    const std::filesystem::path& out_dir,
+    const float k1,
+    const float b,
+    const int block_size,
+    const size_t split_size
 );
 
 std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
     const std::filesystem::path& in_path
 );
 
+// metadata.bin layout: magic "STMD", uint32 format version, then k1, b,
+// avgdl (float), block_size (int), split_size (size_t). Format 1 (before
+// 2026-09-19) began with three length-prefixed absolute paths instead.
+constexpr unsigned int METADATA_FORMAT_VERSION = 2;
+
 /**
- * @brief Write index build metadata (posting_dir, doc_len_dir,
- * doc_len_meta_dir, k1, b, avgdl, block_size, split_size) in two forms: a
- * plain-text key=value file at out_path, one field per line - for humans
- * to read/inspect, never read back programmatically - and a binary twin
- * at out_path with its extension replaced by ".bin" - the exact,
- * length-prefixed-string + fixed-width-field encoding read_metadata
- * actually parses.
+ * @brief Write index build parameters in two forms: a plain-text key=value
+ * file at out_path, one field per line - for humans to read/inspect, never
+ * read back programmatically - and a binary twin at out_path with its
+ * extension replaced by ".bin", the exact encoding read_metadata parses.
  *
+ * No paths are stored: every index file sits next to metadata.bin, which
+ * load_index relies on.
  *
  * @param out_path path to write the human-readable metadata file to; the
  * binary file is written alongside it with the same stem and a .bin extension
- * @param posting_dir directory containing this index's posting_*.bin files
- * @param doc_len_dir path to this index's doc_len_list.bin
- * @param doc_len_meta_dir path to this index's doc_len_meta.bin
  * @param k1 BM25 k1 parameter the index was built with
  * @param b BM25 b parameter the index was built with
  * @param avgdl average document length the block upper bounds were built
@@ -110,9 +134,6 @@ std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
  */
 void write_metadata(
     const std::filesystem::path& out_path,
-    const std::filesystem::path& posting_dir,
-    const std::filesystem::path& doc_len_dir,
-    const std::filesystem::path& doc_len_meta_dir,
     const float k1,
     const float b,
     const float avgdl,
@@ -123,15 +144,13 @@ void write_metadata(
 /**
  * @brief Read back the binary metadata file written by write_metadata (the
  * .bin twin, not the human-readable .txt), populating every out-parameter.
- * Throws std::runtime_error on a missing/unreadable or truncated file.
+ * Throws std::runtime_error on a missing, truncated or older-format file
+ * (the message says to rebuild the index).
  *
  * @param in_path path to the .bin metadata file to read
  */
 void read_metadata(
     const std::filesystem::path& in_path,
-    std::filesystem::path& posting_dir,
-    std::filesystem::path& doc_len_dir,
-    std::filesystem::path& doc_len_meta,
     float& k1,
     float& b,
     float& avgdl,
@@ -161,12 +180,9 @@ struct IndexMeta {
  * block_meta.bin next to it. Every reader of an index (QueryEngine,
  * read_term_df_mapping) goes through here.
  *
- * Index files are resolved relative to meta_path's own folder, not the
- * absolute paths stored inside metadata.bin. merge_inverted_blocks always
- * writes metadata into the posting folder itself, so both give the same files
- * for a freshly built index, but the stored paths go stale once the index
- * folder is moved or renamed. The stored paths are still read, so the file
- * format is unchanged.
+ * Index files are resolved relative to meta_path's own folder: the merge
+ * writes metadata into the posting folder itself, and metadata.bin stores no
+ * paths, so a moved or renamed index folder still loads.
  *
  * @param meta_path path to the index's metadata.bin
  */

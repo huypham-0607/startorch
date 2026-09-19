@@ -12,9 +12,8 @@ public:
         ERROR = 3
     };
 
-    Logger(const char* const _file_name, const Level _default_level = DEBUG);
-
-    Logger(const std::string _file_name, const Level _default_level = DEBUG);
+    // Also takes __FILE_NAME__ (a const char*) through std::string's conversion.
+    Logger(std::string _file_name, const Level _default_level = DEBUG);
 
     void log(std::string message) const;
 

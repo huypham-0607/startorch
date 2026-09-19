@@ -9,6 +9,7 @@
 #include <unistd.h>
 #include <utility>
 #include <vector>
+#include <random>
 
 namespace fs = std::filesystem;
 
@@ -172,4 +173,65 @@ namespace ReadTokenTest{
     }
 
     // TODO: Add Randomized Stress Test to ReadTokenTest
+}
+
+namespace ReadTokenBufferedTest {
+    class ReadTokenBufferedTest : public testing::Test {
+    protected:
+        void SetUp() override { tmp_path = makeUniqueTempDir(); }
+        void TearDown() override { fs::remove_all(tmp_path); }
+        fs::path tmp_path;
+    };
+
+    TEST_F(ReadTokenBufferedTest, MatchesSafeFileOverloadRecordForRecord) {
+        fs::path path = tmp_path / "tokens.bin";
+        std::mt19937_64 mt(9);
+        {
+            SafeFile out(path, "wb");
+            for (int i = 0; i < 3000; i++) {
+                unsigned long long doc_id = mt() % 1000000;
+                std::string term(mt() % 30, 'a');
+                for (char& c : term) c = (char)('a' + mt() % 26);
+                unsigned short len = term.size();
+                fwrite(&doc_id, sizeof(doc_id), 1, out.get());
+                fwrite(&len, sizeof(len), 1, out.get());
+                fwrite(term.data(), 1, term.size(), out.get());
+            }
+        }
+
+        SafeFile legacy(path, "rb");
+        BufferedReader buffered(path, MIN_READ_BUFFER_SIZE);
+        unsigned long long legacy_id, buffered_id;
+        std::string legacy_term, buffered_term;
+        int records = 0;
+        while (read_token(legacy, &legacy_id, &legacy_term)) {
+            ASSERT_TRUE(read_token(buffered, &buffered_id, &buffered_term));
+            ASSERT_EQ(buffered_id, legacy_id);
+            ASSERT_EQ(buffered_term, legacy_term);
+            ++records;
+        }
+        EXPECT_EQ(records, 3000);
+        EXPECT_FALSE(read_token(buffered, &buffered_id, &buffered_term));
+    }
+
+    TEST_F(ReadTokenBufferedTest, TruncatedRecordThrowsAndEmptyStreamReturnsFalse) {
+        fs::path empty = tmp_path / "empty.bin";
+        { SafeFile out(empty, "wb"); }
+        BufferedReader empty_in(empty, MIN_READ_BUFFER_SIZE);
+        unsigned long long doc_id;
+        std::string term;
+        EXPECT_FALSE(read_token(empty_in, &doc_id, &term));
+
+        fs::path partial = tmp_path / "partial.bin";
+        {
+            SafeFile out(partial, "wb");
+            unsigned long long id = 7;
+            unsigned short len = 5;
+            fwrite(&id, sizeof(id), 1, out.get());
+            fwrite(&len, sizeof(len), 1, out.get());
+            fwrite("ab", 1, 2, out.get());   // 2 of 5 term bytes
+        }
+        BufferedReader partial_in(partial, MIN_READ_BUFFER_SIZE);
+        EXPECT_THROW(read_token(partial_in, &doc_id, &term), std::runtime_error);
+    }
 }

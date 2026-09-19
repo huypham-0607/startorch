@@ -1,76 +1,31 @@
-"""Orchestrate build posting process.
+"""Orchestrate the index build for one profile: tokenize, then build_index in C++.
 
 """
 
-from pathlib import Path
-from startorch import get_logger, Tokenizer, startorch_cpp
+from startorch._native import startorch_cpp
+from startorch.paths import Profile
+from startorch.tokenizer.tokenizer import Tokenizer, profile_source
+from startorch.utils import get_logger
+
+logger = get_logger(__name__)
 
 
-class PostingBuildler:
-    # Hyper parameters
-    MEM_LIMIT = (1<<30)
-    K1 = 1.2
-    B = 0.75
-    BLOCK_SIZE = 128
-    SPLIT_SIZE = (1<<30)
-    
+class PostingBuilder:
+    """Builds a profile's index. Paths and build parameters come from its
+    project-config.toml table (see startorch.paths); parameters it doesn't set
+    take BuildParams' defaults in C++."""
 
-    @staticmethod
-    def get_token_stream_file_name(idx: int):
-        return f"token_{idx:04d}.bin"
-
-    def __init__(
-        self,
-        corpus_path: Path,
-        out_path: Path,
-        spill_path: Path,
-        lookup_folder: str,
-        lookup_file_name: str,
-        token_stream_folder: str,
-        posting_folder: str,
-        partial_folder: str
-    ) -> None:
-        self.corpus_path = corpus_path
-        self.out_path = out_path
-        self.spill_path = spill_path
-
-        self.lookup_folder = lookup_folder
-        self.lookup_file_name = lookup_file_name
-        self.token_stream_folder = token_stream_folder
-        self.posting_folder = posting_folder
-        self.partial_folder = partial_folder
-
-        self.lookup_path = self.out_path / self.lookup_folder
-        self.token_stream_path = self.out_path / self.token_stream_folder
-        self.posting_path = self.out_path / self.posting_folder
-        self.partial_path = self.out_path / self.partial_folder
-
+    def __init__(self, profile: Profile) -> None:
+        self.profile = profile
 
     def build(self) -> None:
+        p = self.profile
         tokenizer = Tokenizer()
-        tokenizer.get_token(
-            self.corpus_path,
-            self.token_stream_path,
-            self.lookup_path,
-            self.get_token_stream_file_name,
-            self.lookup_file_name,
-            self.spill_path,
-        )
+        try:
+            tokenizer.get_token(profile_source(p), p.token_dir, p.lookup_file, p.spill_dir)
+        finally:
+            # DuckDB's memory would otherwise stay held through the C++ build.
+            tokenizer.close()
 
-        self.posting_path.mkdir(parents=True, exist_ok=True)
-        self.partial_path.mkdir(parents=True, exist_ok=True)
-
-        startorch_cpp.build_doc_len(self.token_stream_path, self.posting_path)
-        startorch_cpp.build_inverted_blocks(
-            self.token_stream_path,
-            self.partial_path,
-            self.MEM_LIMIT
-        )
-        startorch_cpp.merge_inverted_blocks(
-            self.partial_path,
-            self.posting_path,
-            self.K1,
-            self.B,
-            self.BLOCK_SIZE,
-            self.SPLIT_SIZE
-        )
+        logger.info(f"Building index for {p.name} into {p.posting_dir} with {p.build_params or 'default parameters'}.")
+        startorch_cpp.build_index(p.token_dir, p.partial_dir, p.posting_dir, **p.build_params)

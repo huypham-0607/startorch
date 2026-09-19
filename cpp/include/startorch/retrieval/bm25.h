@@ -41,8 +41,8 @@ float calc_BM25(
     const float tf,
     const float doc_len,
     const float avgdl,
-    const float k1 = 1.2f,
-    const float b = 0.75f
+    const float k1,
+    const float b
 );
 
 #endif

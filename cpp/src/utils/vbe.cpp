@@ -36,6 +36,20 @@ unsigned long long vbe_decode(const unsigned char buffer[]) {
     return decoded;
 }
 
+size_t vbe_decode_from(const unsigned char* buf, size_t available, unsigned long long& value) {
+    unsigned long long decoded = 0;
+    const size_t limit = available < BUFFER_LIMIT ? available : BUFFER_LIMIT;
+    for (size_t idx = 0; idx < limit; idx++) {
+        if (buf[idx] >= 128) {
+            value = decoded + (1ULL << (idx*7)) * (buf[idx] - 128);
+            return idx + 1;
+        }
+        decoded += (1ULL << (idx*7)) * buf[idx];
+    }
+    if (limit == BUFFER_LIMIT) throw std::runtime_error("Buffer limit exceeded for Variable Byte Decoder.");
+    return 0;
+}
+
 /**
  * @brief Read VBE from binary stream
  * 

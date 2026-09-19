@@ -220,3 +220,32 @@ TEST(ReadVbeTest, ReadsSequentialEntries) {
 
     fs::remove_all(tmp_path);
 }
+
+TEST(VbeDecodeFromTest, RoundTripsEveryEncodedLength) {
+    std::mt19937_64 mt(3);
+    for (int i = 0; i < 10000; i++) {
+        unsigned long long v = rd(0, (1ULL << (7 * rd(1, 8, mt))) - 1, mt);
+        unsigned char buf[BUFFER_LIMIT];
+        size_t n = vbe_encode(v, buf);
+        unsigned long long decoded = 0;
+        ASSERT_EQ(vbe_decode_from(buf, n, decoded), n);
+        ASSERT_EQ(decoded, v);
+        ASSERT_EQ(decoded, vbe_decode(buf)) << "must agree with vbe_decode";
+    }
+}
+
+TEST(VbeDecodeFromTest, ReturnsZeroWhenValueContinuesPastAvailable) {
+    unsigned char buf[BUFFER_LIMIT];
+    size_t n = vbe_encode(1ULL << 30, buf);   // several bytes
+    ASSERT_GT(n, 1u);
+    unsigned long long decoded = 42;
+    EXPECT_EQ(vbe_decode_from(buf, n - 1, decoded), 0u);
+    EXPECT_EQ(decoded, 42u) << "value is left untouched when incomplete";
+    EXPECT_EQ(vbe_decode_from(buf, 0, decoded), 0u);
+}
+
+TEST(VbeDecodeFromTest, ThrowsWithoutTerminatorWithinLimit) {
+    unsigned char buf[BUFFER_LIMIT + 1] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    unsigned long long decoded;
+    EXPECT_THROW(vbe_decode_from(buf, sizeof(buf), decoded), std::runtime_error);
+}

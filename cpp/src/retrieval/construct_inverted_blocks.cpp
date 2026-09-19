@@ -15,7 +15,43 @@ namespace fs = std::filesystem;
 
 constexpr unsigned int EST_UMAP_MEM_PER_ENTRY = 48; // Safe estimation of std::unordered_map mem usage per entry
 
-constexpr size_t BUF_SIZE = (1<<20);
+namespace {
+    // One body for both reader types: the SafeFile overload stays for tests.
+    template <typename Reader>
+    bool build_partial_index_impl(
+        Reader& token_stream,
+        const size_t mem_limit,
+        std::unordered_map<std::string, PostingList> &posting_list_mapping,
+        std::vector<std::string> &dictionary,
+        DocLenCounter* const doc_lens
+    ) {
+        size_t mem_usage = 0;
+
+        unsigned long long cur_doc_id;
+        std::string cur_term;
+
+        while ((mem_usage < mem_limit/5*4) && read_token(token_stream, &cur_doc_id, &cur_term)) {
+            if (doc_lens != nullptr) doc_lens->add(cur_doc_id);
+
+            // One hash lookup per token: try_emplace finds or inserts.
+            auto [it, inserted] = posting_list_mapping.try_emplace(cur_term);
+            if (inserted) {
+                dictionary.push_back(cur_term);
+
+                // Estimate memory usage
+                mem_usage += sizeof(cur_term) + cur_term.size();
+                mem_usage += sizeof(cur_term) + cur_term.size() + sizeof(PostingList) + EST_UMAP_MEM_PER_ENTRY;
+            }
+            if (!it->second.has_document(cur_doc_id)) {
+                mem_usage += sizeof(PostingItem);
+            }
+            it->second.add_document(cur_doc_id);
+        }
+
+        std::sort(dictionary.begin(), dictionary.end());
+        return (dictionary.size() != 0);
+    }
+}
 
 bool build_partial_index(
     const SafeFile& token_stream,
@@ -23,28 +59,17 @@ bool build_partial_index(
     std::unordered_map<std::string, PostingList> &posting_list_mapping,
     std::vector<std::string> &dictionary
 ) {
-    size_t mem_usage = 0;
+    return build_partial_index_impl(token_stream, mem_limit, posting_list_mapping, dictionary, nullptr);
+}
 
-    unsigned long long cur_doc_id;
-    std::string cur_term;
-
-    while ((mem_usage < mem_limit/5*4) && read_token(token_stream, &cur_doc_id, &cur_term)) {
-        if (posting_list_mapping.find(cur_term) == posting_list_mapping.end()) {
-            dictionary.push_back(cur_term);
-            posting_list_mapping[cur_term] = PostingList();
-
-            // Estimate memory usage
-            mem_usage += sizeof(cur_term) + cur_term.size();
-            mem_usage += sizeof(cur_term) + cur_term.size() + sizeof(PostingList) + EST_UMAP_MEM_PER_ENTRY;
-        }
-        if (!posting_list_mapping[cur_term].has_document(cur_doc_id)) {
-            mem_usage += sizeof(PostingItem);
-        }
-        posting_list_mapping[cur_term].add_document(cur_doc_id);
-    }
-
-    std::sort(dictionary.begin(), dictionary.end());
-    return (dictionary.size() != 0);
+bool build_partial_index(
+    BufferedReader& token_stream,
+    const size_t mem_limit,
+    std::unordered_map<std::string, PostingList> &posting_list_mapping,
+    std::vector<std::string> &dictionary,
+    DocLenCounter* const doc_lens
+) {
+    return build_partial_index_impl(token_stream, mem_limit, posting_list_mapping, dictionary, doc_lens);
 }
 
 /**
@@ -66,34 +91,36 @@ void write_partial_index(
     std::unordered_map<std::string, PostingList>& posting_list_mapping,
     std::vector<std::string>& dictionary
 ) {
-    BufferedWriter out_file(out_file_path, BUF_SIZE);
+    BufferedWriter out_file(out_file_path);
 
     unsigned int dictionary_size = dictionary.size();
-    out_file.fwrite(&dictionary_size, sizeof(dictionary_size), 1);
+    out_file.write(dictionary_size);
 
     unsigned char vbe_buffer[8];
-    for (std::string term : dictionary) {
+    for (const std::string& term : dictionary) {
+        PostingList& postings = posting_list_mapping.at(term);
+
         // The token stream is not in doc_id order, and the gaps below must
         // not underflow. Sorting can also shrink the list, so do it first.
-        posting_list_mapping[term].sort();
+        postings.sort();
 
-        unsigned short term_size = term.size();                                 // 2 bytes
-        unsigned int posting_list_size = posting_list_mapping[term].size();     // 4 bytes should be sufficient
+        unsigned short term_size = term.size();                         // 2 bytes
+        unsigned int posting_list_size = postings.size();               // 4 bytes should be sufficient
 
-        out_file.fwrite(&term_size, sizeof(term_size), 1);
-        out_file.fwrite(&posting_list_size, sizeof(posting_list_size), 1);
+        out_file.write(term_size);
+        out_file.write(posting_list_size);
 
         out_file.fwrite(term.c_str(), sizeof(char), term.size());
 
         // VBE encoding
         unsigned long long last = 0;
-        for (int i = 0; i < posting_list_mapping[term].size(); i++) {
-            PostingItem item = posting_list_mapping[term][i];
+        for (size_t i = 0; i < postings.size(); i++) {
+            const PostingItem& item = postings[i];
             unsigned long long delta = item.doc_id - last;
             int encode_length = vbe_encode(delta, vbe_buffer);
 
             out_file.fwrite(vbe_buffer, sizeof(unsigned char), encode_length);
-            out_file.fwrite(&item.freq, sizeof(item.freq), 1);
+            out_file.write(item.freq);
             last = item.doc_id;
         }
     }
@@ -102,7 +129,8 @@ void write_partial_index(
 void construct_inverted_blocks(
     const fs::path& in_dir,
     const fs::path& out_dir,
-    const size_t mem_limit
+    const size_t mem_limit,
+    DocLenCounter* const doc_lens
 ) {
     Logger logger(__FILE_NAME__, Logger::INFO);
     std::unordered_map<std::string, PostingList> posting_list_mapping;
@@ -116,13 +144,14 @@ void construct_inverted_blocks(
     int partial_block_counter = 0;
 
     for (auto &token_stream : token_streams) {
-        SafeFile fp(token_stream, "rb");
+        BufferedReader in(token_stream);
 
         while (build_partial_index(
-            fp,
+            in,
             mem_limit,
             posting_list_mapping,
-            dictionary
+            dictionary,
+            doc_lens
         )) {
             write_partial_index(
                 out_dir / file_names::partial_block_file_name(partial_block_counter),

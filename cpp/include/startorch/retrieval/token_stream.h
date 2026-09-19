@@ -23,4 +23,12 @@ bool read_token(
     std::string* const ptr_term
 );
 
+// Same record format and end-of-stream rules, read through a BufferedReader.
+// This is the overload the build uses.
+bool read_token(
+    BufferedReader& token_stream,
+    unsigned long long* const ptr_doc_id,
+    std::string* const ptr_term
+);
+
 #endif

@@ -1,4 +1,5 @@
 #include "startorch/utils/file_io.h"
+#include "startorch/utils/vbe.h"
 
 #include <random>
 #include <filesystem>
@@ -10,6 +11,7 @@
 #include <format>
 #include <cstdio>
 #include <utility>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -455,9 +457,71 @@ namespace BufferedWriterTest {
         }
     }
 
+    TEST_F(BufferedWriterTest, WriteLargerThanBufferBypassesItAndKeepsOrder) {
+        fs::path file_name = tmp_path / "large.bin";
+        std::vector<unsigned char> head = {1, 2, 3};
+        std::vector<unsigned char> big(3 * MIN_BUF_SIZE);
+        for (size_t i = 0; i < big.size(); i++) big[i] = (unsigned char)(i * 7);
+        {
+            BufferedWriter writer(file_name, MIN_BUF_SIZE);
+            writer.fwrite(head.data(), 1, head.size());
+            writer.fwrite(big.data(), 1, big.size());   // flushes head, then writes directly
+            EXPECT_EQ(writer.ftell(), (long)(head.size() + big.size()));
+            writer.fwrite(head.data(), 1, head.size());
+        }
+        std::vector<unsigned char> expected = head;
+        expected.insert(expected.end(), big.begin(), big.end());
+        expected.insert(expected.end(), head.begin(), head.end());
+        EXPECT_EQ(read_all_bytes(file_name), expected);
+    }
+
     TEST_F(BufferedWriterTest, ThrowsOnBufferSizeBelowMinimum) {
         fs::path file_name = tmp_path / "too_small.bin";
         ASSERT_THROW(BufferedWriter writer(file_name, MIN_BUF_SIZE - 1), std::runtime_error);
+    }
+
+    // write takes lvalues only, so a value's width on disk is always its
+    // declared type: write(term.size()) would silently write 8 bytes.
+    template <typename T>
+    concept WritesTemporary = requires(BufferedWriter& writer) { writer.write(T{}); };
+    static_assert(!WritesTemporary<unsigned int>);
+    static_assert(requires(BufferedWriter& writer, unsigned int& value) { writer.write(value); });
+    static_assert(requires(BufferedWriter& writer, const unsigned int& value) { writer.write(value); });
+
+    TEST_F(BufferedWriterTest, WriteAndFwriteRoundTripThroughReadAndFread) {
+        fs::path file_name = tmp_path / "round_trip.bin";
+        const unsigned short term_size = 3;
+        const unsigned long long doc_id = 0x0123456789abcdefULL;
+        const float scores[3] = {0.5f, 1.25f, -2.0f};
+        const char magic[4] = {'S', 'T', 'M', 'D'};
+        const std::string term = "abc";
+        {
+            BufferedWriter writer(file_name, MIN_BUF_SIZE);
+            writer.write(term_size);
+            writer.fwrite(term.c_str(), sizeof(char), term.size());
+            writer.write(doc_id);
+            writer.fwrite(scores, sizeof(float), 3);
+            writer.write(magic);
+            EXPECT_EQ(writer.ftell(), (long)(sizeof(term_size) + term.size() + sizeof(doc_id) + sizeof(scores) + sizeof(magic)));
+        }
+
+        BufferedReader in(file_name, MIN_READ_BUFFER_SIZE);
+        unsigned short got_size;
+        std::string got_term(term_size, '\0');
+        unsigned long long got_id;
+        float got_scores[3];
+        char got_magic[4];
+        ASSERT_TRUE(in.read(got_size));
+        ASSERT_TRUE(in.fread(got_term.data(), sizeof(char), got_size));
+        ASSERT_TRUE(in.read(got_id));
+        ASSERT_TRUE(in.fread(got_scores, sizeof(float), 3));
+        ASSERT_TRUE(in.read(got_magic));
+        EXPECT_EQ(got_size, term_size);
+        EXPECT_EQ(got_term, term);
+        EXPECT_EQ(got_id, doc_id);
+        EXPECT_EQ(std::memcmp(got_scores, scores, sizeof(scores)), 0);
+        EXPECT_EQ(std::memcmp(got_magic, magic, sizeof(magic)), 0);
+        EXPECT_FALSE(in.read(got_size));
     }
 }
 
@@ -645,5 +709,190 @@ TEST_F(GlobFilesTest, RandomWithPrefix) {
                 fs::remove(entry.path());
             }
         }
+    }
+}
+
+namespace BufferedReaderTest {
+    class BufferedReaderTest : public testing::Test {
+    protected:
+        void SetUp() override { tmp_path = makeUniqueTempDir(); }
+        void TearDown() override { fs::remove_all(tmp_path); }
+
+        fs::path tmp_path;
+
+        fs::path write_bytes(const std::string& name, const std::vector<unsigned char>& bytes) {
+            fs::path path = tmp_path / name;
+            SafeFile out(path, "wb");
+            if (!bytes.empty()) fwrite(bytes.data(), 1, bytes.size(), out.get());
+            return path;
+        }
+    };
+
+    struct Record {
+        unsigned long long id;
+        unsigned short len;
+        std::string text;
+    };
+
+    TEST_F(BufferedReaderTest, ReadsRecordsSplitAcrossRefills) {
+        // Mixed-width records with a 16-byte buffer, so values and strings
+        // routinely straddle refills.
+        std::mt19937_64 mt(11);
+        std::vector<Record> records;
+        std::vector<unsigned char> bytes;
+        for (int i = 0; i < 5000; i++) {
+            Record r{rd(0, ~0ULL, mt), (unsigned short)rd(0, 40, mt), ""};
+            for (int c = 0; c < r.len; c++) r.text.push_back((char)('a' + rd(0, 25, mt)));
+            const unsigned char* id = reinterpret_cast<const unsigned char*>(&r.id);
+            const unsigned char* len = reinterpret_cast<const unsigned char*>(&r.len);
+            bytes.insert(bytes.end(), id, id + sizeof(r.id));
+            bytes.insert(bytes.end(), len, len + sizeof(r.len));
+            bytes.insert(bytes.end(), r.text.begin(), r.text.end());
+            records.push_back(r);
+        }
+        fs::path path = write_bytes("records.bin", bytes);
+
+        for (size_t buf_size : {MIN_READ_BUFFER_SIZE, (size_t)17, (size_t)4096, READ_BUFFER_SIZE}) {
+            BufferedReader in(path, buf_size);
+            for (const Record& r : records) {
+                unsigned long long id;
+                unsigned short len;
+                ASSERT_TRUE(in.read(id));
+                ASSERT_TRUE(in.read(len));
+                std::string text(len, '\0');
+                ASSERT_TRUE(in.fread(text.data(), sizeof(char), len));
+                ASSERT_EQ(id, r.id) << "buffer " << buf_size;
+                ASSERT_EQ(len, r.len);
+                ASSERT_EQ(text, r.text);
+            }
+            unsigned long long extra;
+            EXPECT_FALSE(in.read(extra)) << "clean end of file after the last record";
+        }
+    }
+
+    TEST_F(BufferedReaderTest, ReadsVbeValuesSplitAcrossRefills) {
+        std::mt19937_64 mt(5);
+        std::vector<unsigned long long> values;
+        std::vector<unsigned char> bytes;
+        for (int i = 0; i < 20000; i++) {
+            // Spread over every encoded length, 1 to 8 bytes.
+            unsigned long long v = rd(0, (1ULL << (7 * rd(1, 8, mt))) - 1, mt);
+            unsigned char buf[BUFFER_LIMIT];
+            size_t n = vbe_encode(v, buf);
+            bytes.insert(bytes.end(), buf, buf + n);
+            values.push_back(v);
+        }
+        fs::path path = write_bytes("vbe.bin", bytes);
+
+        for (size_t buf_size : {MIN_READ_BUFFER_SIZE, (size_t)17, (size_t)23, (size_t)4096}) {
+            BufferedReader in(path, buf_size);
+            for (unsigned long long expected : values) {
+                unsigned long long v;
+                ASSERT_TRUE(in.read_vbe(v));
+                ASSERT_EQ(v, expected) << "buffer " << buf_size;
+            }
+            unsigned long long v;
+            EXPECT_FALSE(in.read_vbe(v));
+        }
+    }
+
+    TEST_F(BufferedReaderTest, CleanEndOfFileReturnsFalseForEveryReadKind) {
+        fs::path path = write_bytes("two.bin", {1, 0, 0, 0, 2, 0, 0, 0});
+        BufferedReader in(path, MIN_READ_BUFFER_SIZE);
+        unsigned int a, b, c;
+        EXPECT_TRUE(in.read(a));
+        EXPECT_TRUE(in.read(b));
+        EXPECT_EQ(a, 1u);
+        EXPECT_EQ(b, 2u);
+        EXPECT_FALSE(in.read(c));
+        unsigned long long v;
+        EXPECT_FALSE(in.read_vbe(v));
+        char byte;
+        EXPECT_FALSE(in.fread(&byte, 1));
+
+        BufferedReader empty(write_bytes("empty.bin", {}), MIN_READ_BUFFER_SIZE);
+        EXPECT_FALSE(empty.read(a));
+    }
+
+    TEST_F(BufferedReaderTest, TruncatedValueThrows) {
+        BufferedReader in(write_bytes("short.bin", {1, 2, 3}), MIN_READ_BUFFER_SIZE);
+        unsigned long long v;
+        EXPECT_THROW(in.read(v), std::runtime_error);
+    }
+
+    TEST_F(BufferedReaderTest, TruncatedVbeThrows) {
+        // Continuation bytes with no terminator before the file ends.
+        BufferedReader in(write_bytes("vbe_short.bin", {1, 2}), MIN_READ_BUFFER_SIZE);
+        unsigned long long v;
+        EXPECT_THROW(in.read_vbe(v), std::runtime_error);
+    }
+
+    TEST_F(BufferedReaderTest, OverlongVbeThrows) {
+        BufferedReader in(write_bytes("vbe_long.bin", {1, 1, 1, 1, 1, 1, 1, 1, 1}), MIN_READ_BUFFER_SIZE);
+        unsigned long long v;
+        EXPECT_THROW(in.read_vbe(v), std::runtime_error);
+    }
+
+    TEST_F(BufferedReaderTest, ReadLargerThanBufferGoesStraightToDestination) {
+        std::vector<unsigned char> bytes(1000);
+        for (size_t i = 0; i < bytes.size(); i++) bytes[i] = (unsigned char)(i * 13);
+        BufferedReader in(write_bytes("big.bin", bytes), MIN_READ_BUFFER_SIZE);
+
+        std::vector<unsigned char> head(5), middle(900), tail(95);
+        ASSERT_TRUE(in.fread(head.data(), 1, head.size()));
+        ASSERT_TRUE(in.fread(middle.data(), 1, middle.size()));
+        ASSERT_TRUE(in.fread(tail.data(), 1, tail.size()));
+
+        std::vector<unsigned char> all = head;
+        all.insert(all.end(), middle.begin(), middle.end());
+        all.insert(all.end(), tail.begin(), tail.end());
+        EXPECT_EQ(all, bytes);
+        unsigned char extra;
+        EXPECT_FALSE(in.fread(&extra, 1));
+    }
+
+    TEST_F(BufferedReaderTest, FreadReadsCountItemsAcrossRefills) {
+        // 40 bytes of uint32 items through a 16-byte buffer: every call spans refills.
+        std::vector<unsigned char> bytes;
+        for (unsigned int v = 0; v < 10; v++) {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(&v);
+            bytes.insert(bytes.end(), p, p + sizeof(v));
+        }
+        BufferedReader in(write_bytes("items.bin", bytes), MIN_READ_BUFFER_SIZE);
+
+        unsigned int first[3], rest[7];
+        ASSERT_TRUE(in.fread(first, sizeof(unsigned int), 3));
+        ASSERT_TRUE(in.fread(rest, sizeof(unsigned int), 7));
+        for (unsigned int i = 0; i < 3; i++) EXPECT_EQ(first[i], i);
+        for (unsigned int i = 0; i < 7; i++) EXPECT_EQ(rest[i], i + 3);
+        EXPECT_FALSE(in.fread(first, sizeof(unsigned int), 3));
+    }
+
+    TEST_F(BufferedReaderTest, FreadThrowsWhenItemsAreCutShort) {
+        // 10 bytes: two whole uint32 items and half of a third.
+        BufferedReader in(write_bytes("cut.bin", {1, 0, 0, 0, 2, 0, 0, 0, 3, 0}), MIN_READ_BUFFER_SIZE);
+        unsigned int items[3];
+        EXPECT_THROW(in.fread(items, sizeof(unsigned int), 3), std::runtime_error);
+    }
+
+    TEST_F(BufferedReaderTest, MoveKeepsReadPosition) {
+        fs::path path = write_bytes("move.bin", {1, 0, 2, 0, 3, 0});
+        BufferedReader first(path, MIN_READ_BUFFER_SIZE);
+        unsigned short v;
+        ASSERT_TRUE(first.read(v));
+        BufferedReader second(std::move(first));
+        ASSERT_TRUE(second.read(v));
+        EXPECT_EQ(v, 2);
+        std::vector<BufferedReader> readers;
+        readers.push_back(std::move(second));
+        ASSERT_TRUE(readers[0].read(v));
+        EXPECT_EQ(v, 3);
+        EXPECT_FALSE(readers[0].read(v));
+    }
+
+    TEST_F(BufferedReaderTest, ThrowsOnMissingFileAndTinyBuffer) {
+        EXPECT_THROW(BufferedReader(tmp_path / "missing.bin"), std::runtime_error);
+        fs::path path = write_bytes("x.bin", {1});
+        EXPECT_THROW(BufferedReader(path, MIN_READ_BUFFER_SIZE - 1), std::runtime_error);
     }
 }

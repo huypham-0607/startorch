@@ -57,6 +57,8 @@ set(STARTORCH_SOURCES
     src/retrieval/construct_inverted_blocks.cpp
     src/retrieval/construct_doc_len_list.cpp
     src/retrieval/merge_inverted_blocks.cpp
+    src/retrieval/build_params.cpp
+    src/retrieval/build_index.cpp
     src/retrieval/query_engine.cpp
 )
 
@@ -75,6 +77,10 @@ add_executable(build_doc_len_list apps/build_doc_len_list.cpp)
 target_link_libraries(build_doc_len_list PRIVATE startorch_core)
 add_executable(merge_inverted_blocks apps/merge_inverted_blocks.cpp)
 target_link_libraries(merge_inverted_blocks PRIVATE startorch_core)
+
+# Benchmarks (not tests): compare the stdio readers with BufferedReader.
+add_executable(io_bench benchmarks/io_bench.cpp)
+target_link_libraries(io_bench PRIVATE startorch_core)
 
 # Adding tests
 enable_testing()

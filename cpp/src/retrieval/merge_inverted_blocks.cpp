@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <format>
 #include <queue>
 #include <stdexcept>
@@ -37,7 +38,30 @@
 
 namespace fs = std::filesystem;
 
-constexpr size_t BUF_SIZE = (1<<20);
+namespace {
+    // Read helpers for fields that must be present: the file ending here
+    // means it is truncated, so a false return becomes an error.
+    template <typename T>
+    void read_field(BufferedReader& in, T& value) {
+        if (!in.read(value)) {
+            throw std::runtime_error(std::format("Failed to read file {}.", in.path().string()));
+        }
+    }
+
+    void fread_field(BufferedReader& in, void* const dst, const size_t n, const size_t count) {
+        if (!in.fread(dst, n, count)) {
+            throw std::runtime_error(std::format("Failed to read file {}.", in.path().string()));
+        }
+    }
+
+    void read_field_vbe(BufferedReader& in, unsigned long long& value) {
+        if (!in.read_vbe(value)) {
+            throw std::runtime_error(std::format("Failed to read file {}.", in.path().string()));
+        }
+    }
+
+    constexpr char METADATA_MAGIC[4] = {'S', 'T', 'M', 'D'};
+}
 
 BlockMeta::BlockMeta(
     unsigned long long _doc_id,
@@ -53,30 +77,23 @@ TermMeta::TermMeta() : term_ub(0.0f), end_addr(0), doc_count(0), file_index(0) {
 // <term_size><posting_list_size><term><<vbe_encoding_{i}><freq_{i}>>
 class Stream {
 public:
-    Stream(const fs::path in_path) : in_file(SafeFile(in_path, "rb")) {
+    // Every partial block is open at once during the merge (234 on full-en),
+    // so each gets a smaller buffer than a sequential pass would.
+    Stream(const fs::path in_path) : in_file(in_path, STREAM_READ_BUFFER_SIZE) {
         is_empty = false;
 
-        in_file.fread(&dict_size, sizeof(dict_size), 1);
+        read_field(in_file, dict_size);
         if (dict_size == 0) {
             is_empty = true;
         }
         else {
             list_id = 0;
-
-            // Setting up first posting_list
-            unsigned short term_size;
-            in_file.fread(&term_size, sizeof(term_size), 1);
-            in_file.fread(&list_size, sizeof(list_size), 1);
-            term.clear(); term.resize(term_size);
-            in_file.fread(&(term[0]), sizeof(char), term_size);
+            read_list_header();
 
             // Setting up first posting_item (posting list should be non-empty)
             item_id = 0;
             doc_id = 0;
-            unsigned char buffer[BUFFER_LIMIT];
-            read_vbe(in_file.get(), buffer);
-            doc_id += vbe_decode(buffer);
-            in_file.fread(&freq, sizeof(freq), 1);
+            read_item();
         }
     }
 
@@ -111,7 +128,7 @@ public:
         return list_size;
     }
 
-    std::string get_term() const {
+    const std::string& get_term() const {
         if (is_empty) {
             throw std::runtime_error(std::format(
                 "Accessing term in an empty Stream"
@@ -146,25 +163,17 @@ public:
                 return false;
             }
 
-            unsigned short term_size;
-            in_file.fread(&term_size, sizeof(term_size), 1);
-            in_file.fread(&list_size, sizeof(list_size), 1);
-            term.clear(); term.resize(term_size);
-            in_file.fread(&(term[0]), sizeof(char), term_size);
-
+            read_list_header();
             item_id = 0;
             doc_id = 0;
         }
 
-        unsigned char buffer[BUFFER_LIMIT];
-        read_vbe(in_file.get(), buffer);
-        doc_id += vbe_decode(buffer);
-        in_file.fread(&freq, sizeof(freq), 1);
+        read_item();
         return true;
     }
 
 private:
-    SafeFile in_file;
+    BufferedReader in_file;
     bool is_empty;
     unsigned int dict_size;
 
@@ -175,6 +184,21 @@ private:
     unsigned int item_id;
     unsigned long long doc_id;
     unsigned int freq;
+
+    void read_list_header() {
+        unsigned short term_size;
+        read_field(in_file, term_size);
+        read_field(in_file, list_size);
+        term.resize(term_size);
+        fread_field(in_file, term.data(), sizeof(char), term_size);
+    }
+
+    void read_item() {
+        unsigned long long delta;
+        read_field_vbe(in_file, delta);
+        doc_id += delta;
+        read_field(in_file, freq);
+    }
 };
 
 /**
@@ -212,7 +236,7 @@ BlockMeta flush_buffer(
         unsigned long long posting_delta = item.doc_id - last;
         int encode_length = vbe_encode(posting_delta, vbe_buffer);
         out_file.fwrite(vbe_buffer, sizeof(unsigned char), encode_length);
-        out_file.fwrite(&item.freq, sizeof(item.freq), 1);
+        out_file.write(item.freq);
         last = item.doc_id;
         bytes_written += encode_length + sizeof(item.freq);
 
@@ -281,8 +305,12 @@ size_t build_posting_list(
             ++term_meta.doc_count;
         }
 
+        // A stream is still on this term until next() moves it to its next
+        // posting list, which an integer compare detects without copying or
+        // comparing the term string once per posting.
+        const unsigned int list_id = streams[stream_id].get_list_id();
         streams[stream_id].next();
-        if (!streams[stream_id].empty() && streams[stream_id].get_term() == term) {
+        if (!streams[stream_id].empty() && streams[stream_id].get_list_id() == list_id) {
             item_heap.push(std::make_pair(streams[stream_id].get_item(),stream_id));
         }
     }
@@ -329,20 +357,20 @@ void write_block_meta_file(
     const fs::path& out_path,
     const std::unordered_map<std::string, TermMeta>& term_meta_mapping
 ) {
-    BufferedWriter out_file(out_path, BUF_SIZE);
+    BufferedWriter out_file(out_path);
 
     for (const auto& [term, term_meta] : term_meta_mapping) {
         unsigned short term_size = term.size();
-        out_file.fwrite(&term_size, sizeof(term_size), 1);
+        out_file.write(term_size);
         out_file.fwrite(term.c_str(), sizeof(char), term_size);
 
-        out_file.fwrite(&term_meta.term_ub, sizeof(term_meta.term_ub), 1);
-        out_file.fwrite(&term_meta.end_addr, sizeof(term_meta.end_addr), 1);
-        out_file.fwrite(&term_meta.doc_count, sizeof(term_meta.doc_count), 1);
-        out_file.fwrite(&term_meta.file_index, sizeof(term_meta.file_index), 1);
+        out_file.write(term_meta.term_ub);
+        out_file.write(term_meta.end_addr);
+        out_file.write(term_meta.doc_count);
+        out_file.write(term_meta.file_index);
 
         unsigned int block_count = term_meta.block_meta_list.size();
-        out_file.fwrite(&block_count, sizeof(block_count), 1);
+        out_file.write(block_count);
 
         unsigned char vbe_buffer[BUFFER_LIMIT];
         unsigned long long prev_start_doc_id = 0;
@@ -352,8 +380,8 @@ void write_block_meta_file(
 
             int encode_length = vbe_encode(delta, vbe_buffer);
             out_file.fwrite(vbe_buffer, sizeof(unsigned char), encode_length);
-            out_file.fwrite(&block.start_addr, sizeof(block.start_addr), 1);
-            out_file.fwrite(&block.block_ub, sizeof(block.block_ub), 1);
+            out_file.write(block.start_addr);
+            out_file.write(block.block_ub);
         }
     }
 }
@@ -361,40 +389,41 @@ void write_block_meta_file(
 std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
     const fs::path& in_path
 ) {
-    SafeFile in_file(in_path, "rb");
+    BufferedReader in_file(in_path);
     std::vector<std::pair<std::string, TermMeta>> result;
 
     while (true) {
         unsigned short term_size;
-        if (!in_file.fread(&term_size, sizeof(term_size), 1, false)) break;
+        if (!in_file.read(term_size)) break;
 
         std::string term(term_size, '\0');
-        in_file.fread(&term[0], sizeof(char), term_size);
+        fread_field(in_file, term.data(), sizeof(char), term_size);
 
         TermMeta term_meta;
-        in_file.fread(&term_meta.term_ub, sizeof(term_meta.term_ub), 1);
-        in_file.fread(&term_meta.end_addr, sizeof(term_meta.end_addr), 1);
-        in_file.fread(&term_meta.doc_count, sizeof(term_meta.doc_count), 1);
-        in_file.fread(&term_meta.file_index, sizeof(term_meta.file_index), 1);
+        read_field(in_file, term_meta.term_ub);
+        read_field(in_file, term_meta.end_addr);
+        read_field(in_file, term_meta.doc_count);
+        read_field(in_file, term_meta.file_index);
 
         unsigned int block_count;
-        in_file.fread(&block_count, sizeof(block_count), 1);
+        read_field(in_file, block_count);
+        term_meta.block_meta_list.reserve(block_count);
 
         unsigned long long cur_start_doc_id = 0;
         for (unsigned int i = 0; i < block_count; i++) {
-            unsigned char vbe_buffer[BUFFER_LIMIT];
-            read_vbe(in_file.get(), vbe_buffer);
-            cur_start_doc_id += vbe_decode(vbe_buffer);
+            unsigned long long delta;
+            read_field_vbe(in_file, delta);
+            cur_start_doc_id += delta;
 
             size_t start_addr;
             float block_ub;
-            in_file.fread(&start_addr, sizeof(start_addr), 1);
-            in_file.fread(&block_ub, sizeof(block_ub), 1);
+            read_field(in_file, start_addr);
+            read_field(in_file, block_ub);
 
-            term_meta.block_meta_list.push_back(BlockMeta(cur_start_doc_id, start_addr, block_ub));
+            term_meta.block_meta_list.emplace_back(cur_start_doc_id, start_addr, block_ub);
         }
 
-        result.push_back({term, term_meta});
+        result.emplace_back(std::move(term), std::move(term_meta));
     }
 
     return result;
@@ -402,9 +431,6 @@ std::vector<std::pair<std::string, TermMeta>> read_block_meta_file(
 
 void write_metadata(
     const fs::path& out_path,
-    const fs::path& posting_dir,
-    const fs::path& doc_len_dir,
-    const fs::path& doc_len_meta_dir,
     const float k1,
     const float b,
     const float avgdl,
@@ -412,118 +438,93 @@ void write_metadata(
     const size_t split_size
 ) {
     // Human-readable copy, for inspection only - never read back by
-    // read_metadata. "%f" truncates to 6 digits after the decimal, which
-    // does not round-trip an IEEE-754 float exactly in general.
+    // read_metadata.
     SafeFile txt_file(out_path, "w");
-    int res = 0;
-
-    res = (res || (std::fprintf(txt_file.get(), "posting_dir=%s\n", posting_dir.string().c_str()) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "doc_len_dir=%s\n", doc_len_dir.string().c_str()) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "doc_len_meta_dir=%s\n", doc_len_meta_dir.string().c_str()) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "k1=%f\n", k1) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "b=%f\n", b) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "avgdl=%f\n", avgdl) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "block_size=%d\n", block_size) < 0));
-    res = (res || (std::fprintf(txt_file.get(), "split_size=%zu\n", split_size) < 0));
-
-    if (res) {
+    const std::string text = std::format(
+        "format_version={}\nk1={}\nb={}\navgdl={}\nblock_size={}\nsplit_size={}\n",
+        METADATA_FORMAT_VERSION, k1, b, avgdl, block_size, split_size
+    );
+    if (std::fputs(text.c_str(), txt_file.get()) < 0) {
         throw std::runtime_error(std::format(
             "Failed to write metadata to {}",
             out_path.string()
         ));
     }
 
-    // Binary twin - authoritative, exact, what read_metadata actually
-    // parses. Same length-prefixed-string convention as write_block_meta_file
-    // uses for terms.
+    // Binary twin - authoritative, exact, what read_metadata actually parses:
+    // magic, format version, then the parameters. No paths: every index file
+    // sits next to metadata.bin (see load_index).
     fs::path bin_path = out_path;
     bin_path.replace_extension(file_names::METADATA_BIN_EXTENSION);
     SafeFile bin_file(bin_path, "wb");
 
-    std::string posting_dir_str = posting_dir.string();
-    unsigned short posting_dir_len = posting_dir_str.size();
-    fwrite(&posting_dir_len, sizeof(posting_dir_len), 1, bin_file.get());
-    fwrite(posting_dir_str.c_str(), sizeof(char), posting_dir_len, bin_file.get());
+    char magic[sizeof(METADATA_MAGIC)];
+    std::memcpy(magic, METADATA_MAGIC, sizeof(magic));
+    unsigned int version = METADATA_FORMAT_VERSION;
+    float k1_v = k1, b_v = b, avgdl_v = avgdl;
+    int block_size_v = block_size;
+    size_t split_size_v = split_size;
 
-    std::string doc_len_dir_str = doc_len_dir.string();
-    unsigned short doc_len_dir_len = doc_len_dir_str.size();
-    fwrite(&doc_len_dir_len, sizeof(doc_len_dir_len), 1, bin_file.get());
-    fwrite(doc_len_dir_str.c_str(), sizeof(char), doc_len_dir_len, bin_file.get());
-
-    std::string doc_len_meta_dir_str = doc_len_meta_dir.string();
-    unsigned short doc_len_meta_dir_len = doc_len_meta_dir_str.size();
-    fwrite(&doc_len_meta_dir_len, sizeof(doc_len_meta_dir_len), 1, bin_file.get());
-    fwrite(doc_len_meta_dir_str.c_str(), sizeof(char), doc_len_meta_dir_len, bin_file.get());
-
-    fwrite(&k1, sizeof(k1), 1, bin_file.get());
-    fwrite(&b, sizeof(b), 1, bin_file.get());
-    fwrite(&avgdl, sizeof(avgdl), 1, bin_file.get());
-    fwrite(&block_size, sizeof(block_size), 1, bin_file.get());
-    fwrite(&split_size, sizeof(split_size), 1, bin_file.get());
+    bin_file.fwrite(magic, sizeof(char), sizeof(magic));
+    bin_file.fwrite(&version, sizeof(version), 1);
+    bin_file.fwrite(&k1_v, sizeof(k1_v), 1);
+    bin_file.fwrite(&b_v, sizeof(b_v), 1);
+    bin_file.fwrite(&avgdl_v, sizeof(avgdl_v), 1);
+    bin_file.fwrite(&block_size_v, sizeof(block_size_v), 1);
+    bin_file.fwrite(&split_size_v, sizeof(split_size_v), 1);
 }
 
 void read_metadata(
     const fs::path& in_path,
-    fs::path& posting_dir,
-    fs::path& doc_len_dir,
-    fs::path& doc_len_meta_dir,
     float& k1,
     float& b,
     float& avgdl,
     int& block_size,
     size_t& split_size
 ) {
-    SafeFile in_file(in_path, "rb");
+    BufferedReader in_file(in_path, MIN_READ_BUFFER_SIZE * 4);
 
-    unsigned short posting_dir_len;
-    in_file.fread(&posting_dir_len, sizeof(posting_dir_len), 1);
-    std::string posting_dir_str(posting_dir_len, '\0');
-    in_file.fread(&posting_dir_str[0], sizeof(char), posting_dir_len);
-    posting_dir = posting_dir_str;
+    char magic[sizeof(METADATA_MAGIC)];
+    if (!in_file.read(magic) || std::memcmp(magic, METADATA_MAGIC, sizeof(magic)) != 0) {
+        throw std::runtime_error(std::format(
+            "{} is not a format {} metadata file. It was probably written before 2026-09-19 "
+            "(format 1, which stored index paths). Rebuild the index.",
+            in_path.string(), METADATA_FORMAT_VERSION
+        ));
+    }
 
-    unsigned short doc_len_dir_len;
-    in_file.fread(&doc_len_dir_len, sizeof(doc_len_dir_len), 1);
-    std::string doc_len_dir_str(doc_len_dir_len, '\0');
-    in_file.fread(&doc_len_dir_str[0], sizeof(char), doc_len_dir_len);
-    doc_len_dir = doc_len_dir_str;
+    unsigned int version;
+    read_field(in_file, version);
+    if (version != METADATA_FORMAT_VERSION) {
+        throw std::runtime_error(std::format(
+            "{} has metadata format {}, but this build reads format {}. Rebuild the index.",
+            in_path.string(), version, METADATA_FORMAT_VERSION
+        ));
+    }
 
-    unsigned short doc_len_meta_dir_len;
-    in_file.fread(&doc_len_meta_dir_len, sizeof(doc_len_meta_dir_len), 1);
-    std::string doc_len_meta_dir_str(doc_len_meta_dir_len, '\0');
-    in_file.fread(&doc_len_meta_dir_str[0], sizeof(char), doc_len_meta_dir_len);
-    doc_len_meta_dir = doc_len_meta_dir_str;
-
-    // Potentially add validations here.
-    in_file.fread(&k1, sizeof(k1), 1);
-    in_file.fread(&b, sizeof(b), 1);
-    in_file.fread(&avgdl, sizeof(avgdl), 1);
-    in_file.fread(&block_size, sizeof(block_size), 1);
-    in_file.fread(&split_size, sizeof(split_size), 1);
+    read_field(in_file, k1);
+    read_field(in_file, b);
+    read_field(in_file, avgdl);
+    read_field(in_file, block_size);
+    read_field(in_file, split_size);
 }
 
-void merge_inverted_blocks(
+void merge_partial_blocks(
     const fs::path& in_dir,
     const fs::path& out_dir,
-    const float k1,
-    const float b,
-    const int block_size,
-    const size_t split_size
+    const std::vector<unsigned int>& doc_len_list,
+    const unsigned long long total_docs,
+    const unsigned long long total_frequency,
+    const BuildParams& params
 ) {
+    params.validate();
     Logger logger(__FILE_NAME__, Logger::INFO);
-
-    std::vector<unsigned int> doc_len_list;
-
-    fs::path doc_len_dir = out_dir / file_names::DOC_LEN_LIST;
-    fs::path doc_len_meta_dir = out_dir / file_names::DOC_LEN_META;
-
-    read_doc_len_list(doc_len_dir, doc_len_list);
 
     // The single avgdl for this index: total tokens over documents that
     // produced at least one token. doc_len_list.size() is not used here -
     // it also counts doc_id gaps (documents with no tokens). Written to
     // metadata below, so the query engine scores with exactly the value
     // these block upper bounds were built with.
-    const auto [total_docs, total_frequency] = read_doc_len_meta(doc_len_meta_dir);
     const float avgdl = static_cast<float>(
         static_cast<double>(total_frequency) / static_cast<double>(total_docs)
     );
@@ -534,6 +535,7 @@ void merge_inverted_blocks(
 
 
     std::vector<Stream> streams;
+    streams.reserve(in_paths.size());
     std::priority_queue<
         std::pair<std::string, int>,
         std::vector<std::pair<std::string, int>>,
@@ -554,10 +556,7 @@ void merge_inverted_blocks(
     unsigned int file_index = 0;
 
     std::optional<BufferedWriter> out_file;
-    out_file.emplace(
-        (out_dir / file_names::posting_file_name(file_index)),
-        BUF_SIZE
-    );
+    out_file.emplace(out_dir / file_names::posting_file_name(file_index));
 
     while (!string_heap.empty()) {
         std::string term = string_heap.top().first;
@@ -576,10 +575,10 @@ void merge_inverted_blocks(
             *out_file,
             file_index,
             term_meta_mapping,
-            block_size,
+            params.block_size,
             avgdl,
-            k1,
-            b,
+            params.k1,
+            params.b,
             N
         );
 
@@ -592,17 +591,15 @@ void merge_inverted_blocks(
             }
         }
 
-        if (cur_disk_usage && cur_disk_usage + disk_required > split_size) {
+        if (cur_disk_usage && cur_disk_usage + disk_required > params.split_size) {
             ++file_index;
             cur_disk_usage = 0;
-            out_file.emplace(
-                (out_dir / file_names::posting_file_name(file_index)),
-                BUF_SIZE
-            );
+            out_file.emplace(out_dir / file_names::posting_file_name(file_index));
         }
 
         cur_disk_usage += disk_required;
     }
+    out_file.reset();
 
     write_block_meta_file(out_dir / file_names::BLOCK_META, term_meta_mapping);
 
@@ -610,30 +607,51 @@ void merge_inverted_blocks(
 
     write_metadata(
         out_dir / file_names::METADATA_TXT,
-        out_dir,
-        doc_len_dir,
-        doc_len_meta_dir,
-        k1,
-        b,
+        params.k1,
+        params.b,
         avgdl,
-        block_size,
-        split_size
+        params.block_size,
+        params.split_size
     );
 
     logger.log("Finished writing metadata.");
 }
 
+void merge_inverted_blocks(
+    const fs::path& in_dir,
+    const fs::path& out_dir,
+    const BuildParams& params
+) {
+    params.validate();
+
+    std::vector<unsigned int> doc_len_list;
+    read_doc_len_list(out_dir / file_names::DOC_LEN_LIST, doc_len_list);
+    const auto [total_docs, total_frequency] = read_doc_len_meta(out_dir / file_names::DOC_LEN_META);
+
+    merge_partial_blocks(in_dir, out_dir, doc_len_list, total_docs, total_frequency, params);
+}
+
+void merge_inverted_blocks(
+    const fs::path& in_dir,
+    const fs::path& out_dir,
+    const float k1,
+    const float b,
+    const int block_size,
+    const size_t split_size
+) {
+    BuildParams params;
+    params.k1 = k1;
+    params.b = b;
+    params.block_size = block_size;
+    params.split_size = split_size;
+    merge_inverted_blocks(in_dir, out_dir, params);
+}
+
 IndexMeta load_index(const fs::path& meta_path) {
     IndexMeta index;
+    read_metadata(meta_path, index.k1, index.b, index.avgdl, index.block_size, index.split_size);
 
-    // Stored paths are consumed but unused - see load_index in the header.
-    fs::path stored_posting_dir, stored_doc_len_path, stored_doc_len_meta_path;
-    read_metadata(
-        meta_path,
-        stored_posting_dir, stored_doc_len_path, stored_doc_len_meta_path,
-        index.k1, index.b, index.avgdl, index.block_size, index.split_size
-    );
-
+    // Every index file sits next to metadata.bin.
     index.posting_dir = meta_path.parent_path();
     index.terms = read_block_meta_file(index.posting_dir / file_names::BLOCK_META);
     return index;
@@ -662,6 +680,6 @@ std::vector<std::pair<std::string, unsigned int>> read_term_df_mapping (
         }
     );
     logger.log(std::format("Finished sorting (term, df) mapping."));
-    
+
     return results;
 }

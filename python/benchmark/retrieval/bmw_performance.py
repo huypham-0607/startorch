@@ -2,15 +2,13 @@ import argparse
 import resource
 
 import pandas as pd
-import ms_marco_pipeline
-import full_en_bench_query
 
 from pathlib import Path
-from startorch import get_logger, load_benchmark_config, startorch_cpp
+from startorch import PostingBuilder, Searcher, get_logger, profile, read_query_file
 
 logger = get_logger(__name__)
 
-QUERY_RESULT_FOLDER = "query_result"
+QUERY_SET_LEN = 2000
 
 def write_perf_parquet(
     run_name: str,
@@ -36,49 +34,34 @@ def write_perf_parquet(
 
     combined.to_parquet(out_path)
 
-def run_msmarco_single(filename: str) -> tuple:
-    benchmark_config = load_benchmark_config()
-
-    query_path = Path(benchmark_config["msmarco"]["data-dir"]) / filename
-
-    logger.info(f"Started running MS MARCO queries from {query_path}.")
-
-    ms_marco_pipeline.build_posting(is_forced=False)
-    engine_latency, query_latency = ms_marco_pipeline.run_queries_perf_metrics(query_path)
-
-    logger.info(f"Finished running MS MARCO queries from {query_path}.")
-
-    # Latencies come back as datetime.timedelta - convert to plain milliseconds
-    query_latency_ms = [td.total_seconds() * 1000 for td in query_latency]
-    engine_latency_ms = engine_latency.total_seconds() * 1000
-
-    # Assuming we run on Linux, max_rss is in kilobytes
-    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-
-    return query_latency_ms, engine_latency_ms, max_rss
-
-def run_full_en_single(
+def run_queries(
+    profile_name: str,
     filename: str,
     k: int,
     engine: str = "bmw",
-    cap: int = full_en_bench_query.QUERY_SET_LEN,
+    cap: int | None = None,
 ) -> tuple:
-    benchmark_config = load_benchmark_config()
+    """Run one query set against one profile's index.
 
-    query_path = Path(benchmark_config["paths"]["data-dir"]) / "full-en" / filename
+    Returns (per-query latency in ms, index load latency in ms, peak RSS in KB).
+    Latency is the C++ search time only, as before, so results compare with
+    earlier runs.
+    """
+    p = profile(profile_name)
+    if p.kind == "msmarco" and not p.meta_path.is_file():
+        PostingBuilder(p).build()
 
-    logger.info(f"Started running full-en queries from {query_path}, k = {k}, engine = {engine}, cap = {cap}.")
+    query_path = p.query_dir / filename
+    logger.info(f"Started running {profile_name} queries from {query_path}, k = {k}, engine = {engine}, cap = {cap}.")
 
-    if engine == "exhaustive":
-        _, engine_latency, query_latency = full_en_bench_query.run_queries_exhaustive_perf_metrics(query_path, k, cap)
-    else:
-        _, engine_latency, query_latency = full_en_bench_query.run_queries_perf_metrics(query_path, k, cap)
+    queries = [text for _, text in read_query_file(query_path, cap)]
+    searcher = Searcher(p)
+    results = searcher.search_many(queries, k, exhaustive=(engine == "exhaustive"))
 
-    logger.info(f"Finished running full-en queries from {query_path}, k = {k}, engine = {engine}.")
+    logger.info(f"Finished running {profile_name} queries from {query_path}, k = {k}, engine = {engine}.")
 
-    # Latencies come back as datetime.timedelta - convert to plain milliseconds
-    query_latency_ms = [td.total_seconds() * 1000 for td in query_latency]
-    engine_latency_ms = engine_latency.total_seconds() * 1000
+    query_latency_ms = [r.elapsed.total_seconds() * 1000 for r in results]
+    engine_latency_ms = searcher.load_latency.total_seconds() * 1000
 
     # Assuming we run on Linux, max_rss is in kilobytes
     max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
@@ -112,7 +95,7 @@ def main():
         "document with no pruning. Ignored when type=0 (msmarco)."
     )
     parser.add_argument(
-        "--cap", type=int, default=full_en_bench_query.QUERY_SET_LEN,
+        "--cap", type=int, default=QUERY_SET_LEN,
         help="Max number of queries to use from the query set. Only applies when type=1 "
         "(full-en). Useful for keeping --engine=exhaustive runs tractable, since it has no "
         "pruning to speed it up. Ignored when type=0 (msmarco)."
@@ -122,14 +105,11 @@ def main():
     if args.type == 1 and args.k is None:
         parser.error("--k is required when type=1 (full-en)")
 
-    benchmark_config = load_benchmark_config()
-
     if args.type == 1:
-        query_result_dir = Path(benchmark_config["paths"]["benchmark-dir"]) / "full-en" / QUERY_RESULT_FOLDER
-        out_path = query_result_dir / "perf_raw.parquet"
+        out_path = profile("full-en").result_dir / "perf_raw.parquet"
 
         logger.info(f"Current run: k = {args.k}, engine = {args.engine}, cap = {args.cap}...")
-        query_latency, engine_latency, max_rss = run_full_en_single(args.filename, args.k, args.engine, args.cap)
+        query_latency, engine_latency, max_rss = run_queries("full-en", args.filename, args.k, args.engine, args.cap)
         logger.info(f"Writing full-en performance data to {out_path}, k = {args.k}, engine = {args.engine}.")
         file_name = f"{args.filename}_{args.k}"
         if args.engine == "exhaustive":
@@ -139,10 +119,10 @@ def main():
         )
 
     else:
-        query_latency, engine_latency, max_rss = run_msmarco_single(args.filename)
+        # MS MARCO: pruned search at k = 1000 over the whole query file, as before.
+        query_latency, engine_latency, max_rss = run_queries("msmarco", args.filename, 1000)
 
-        query_result_dir = Path(benchmark_config["msmarco"]["posting-dir"]) / QUERY_RESULT_FOLDER
-        out_path = query_result_dir / "perf_raw.parquet"
+        out_path = profile("msmarco").result_dir / "perf_raw.parquet"
 
         logger.info(f"Writing MS MARCO performance data to {out_path}.")
         write_perf_parquet(args.filename, query_latency, engine_latency, max_rss, out_path)
