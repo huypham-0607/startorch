@@ -1,4 +1,4 @@
-# Startorch configuration. startorch.paths reads this file and turns a profile
+# Startorch configuration. startorch.utils.paths reads this file and turns a profile
 # name into every artifact path; nothing else builds data paths by hand.
 
 [paths]
@@ -30,7 +30,7 @@ lookup = "doc_id_lookup.bin"
 #                (large profiles, where a copy saves little: see docs/refractor.md).
 #   k1, b, block-size, split-size, mem-limit
 #                Index build parameters. Any left out take BuildParams' defaults
-#                (cpp/include/startorch/retrieval/build_params.h).
+#                (cpp/include/startorch/lexical/build_params.h).
 
 [profiles.math-en]
 kind = "openalex"

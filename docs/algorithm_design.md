@@ -228,7 +228,7 @@ cpp/
 │   │   ├── logger.h                    ✅
 │   │   ├── vbe.h                       ✅ variable-byte encoding
 │   │   └── file_io.h                   ✅ SafeFile + SafeFileMmap (RAII file/mmap wrappers), glob_files
-│   ├── retrieval/
+│   ├── lexical/
 │   │   ├── posting_list.h              ✅ PostingItem, PostingList
 │   │   ├── bm25.h                      ✅ calc_BM25, bm25_saturation
 │   │   ├── token_stream.h              ✅ read_token (tokenizer wire format)
@@ -239,16 +239,12 @@ cpp/
 │   └── graph/                          # CSR/CSC structures, PageRank, PPR headers — not started
 ├── src/
 │   ├── utils/                          ✅ mirrors headers above
-│   ├── retrieval/                      ✅ mirrors headers above, including query_engine.cpp
+│   ├── lexical/                        ✅ mirrors headers above, including query_engine.cpp
 │   └── graph/                          # not started
-├── apps/
-│   ├── build_inverted_blocks.cpp       ✅ CLI: tokenized input -> partial SPIMI blocks
-│   ├── build_doc_len_list.cpp          ✅ CLI: tokenized input -> doc_len_list.bin
-│   ├── merge_inverted_blocks.cpp       ✅ CLI: partial blocks -> posting files + metadata
-│   └── (no CLI entry point for running a query yet)
+├── python/bindings.cpp                 ✅ pybind11 module: build_index, QueryEngine, file_names
 ├── tests/
 │   ├── utils/                          ✅ vbe_tests, file_io_tests
-│   ├── retrieval/                      ✅ one GoogleTest binary per source file above — 134 tests total
+│   ├── lexical/                        ✅ one GoogleTest binary per source file above — 196 tests total
 │   └── graph/
 └── benchmarks/                         # ties to the BEIR/SNAP/OGB datasets already compiled — not started
 ```
@@ -257,12 +253,21 @@ The Python side is being refactored alongside this (see `README.md` for the curr
 
 ```
 python/src/startorch/
-├── cli.py                              ⏳ single startorch command; ingest + gen-works-subset done,
-│                                            build-posting + query commands not added yet
-├── utils.py                            ✅ shared logging/path helpers
-├── ingest/fetch_data.py                ✅ EntityIngestor (base class) + WorksIngestor (the Works entity)
-├── works_subset/works_subset.py        ✅ WorksSubsetter — filters the full corpus into a smaller test set
-└── tokenizer/tokenizer.py              ✅ tokenization + doc_id remapping (works, but not CLI-driven yet)
+├── cli.py                              ✅ single startorch command: ingest, gen-works-subset,
+│                                            build-posting, query
+├── ingest/
+│   ├── fetch_data.py                   ✅ EntityIngestor (base class) + WorksIngestor (the Works entity)
+│   └── works_subset.py                 ✅ WorksSubsetter — filters the full corpus into a smaller test set
+├── lexical/
+│   ├── tokenizer.py                    ✅ tokenization + doc_id remapping, any corpus via a source query
+│   ├── build_posting.py                ✅ PostingBuilder — tokenize, then startorch_cpp.build_index
+│   ├── doc_id_lookup.py                ✅ DocIdLookup — mapped_id <-> raw OpenAlex id
+│   └── search.py                       ✅ Searcher — one loaded index, many queries
+└── utils/
+    ├── paths.py                        ✅ profile(name) over project-config.toml
+    ├── logger.py                       ✅ get_logger
+    ├── duckdb.py                       ✅ fetch_one
+    └── misc.py                         ✅ PROJECT_ROOT, get_current_time
 
 project-config.toml                     ✅ paths + subset filter profiles, at the repo root
 ```

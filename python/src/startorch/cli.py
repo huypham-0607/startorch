@@ -6,7 +6,7 @@
         - query
 
     Every path and build parameter comes from project-config.toml through
-    startorch.paths; this module only parses arguments and dispatches.
+    startorch.utils.paths; this module only parses arguments and dispatches.
 """
 
 import argparse

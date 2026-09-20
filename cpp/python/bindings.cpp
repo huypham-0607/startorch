@@ -2,11 +2,11 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl/filesystem.h>
 #include <pybind11/chrono.h>
-#include "startorch/retrieval/query_engine.h"
-#include "startorch/retrieval/build_index.h"
-#include "startorch/retrieval/build_params.h"
-#include "startorch/retrieval/merge_inverted_blocks.h"
-#include "startorch/retrieval/file_names.h"
+#include "startorch/lexical/query_engine.h"
+#include "startorch/lexical/build_index.h"
+#include "startorch/lexical/build_params.h"
+#include "startorch/lexical/merge_inverted_blocks.h"
+#include "startorch/lexical/file_names.h"
 
 namespace py = pybind11;
 

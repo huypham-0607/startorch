@@ -90,7 +90,7 @@ downstream (posting lists, doc lengths, and eventually the graph) indexes by thi
 makes flat-array O(1) lookups possible everywhere else. Everything past tokenization — dictionary, inversion,
 sorting, block-max metadata, serialization, merge — is C++.
 
-**Build pipeline, three stages, each its own file** (`cpp/src/retrieval/`):
+**Build pipeline, three stages, each its own file** (`cpp/src/lexical/`):
 
 | Stage | File | Output |
 |---|---|---|
@@ -149,7 +149,7 @@ Only documents that survive both shortcuts ever get a real BM25 score computed. 
 behavior Block-Max WAND is named for (see the papers in §3 below) — for a typical query it scores a small
 fraction of the documents that actually contain the search terms, instead of all of them.
 
-**Status**: implemented and tested — `cpp/src/retrieval/query_engine.cpp`, 45 dedicated tests on top of the 89
+**Status**: implemented and tested — `cpp/src/lexical/query_engine.cpp`, 45 dedicated tests on top of the 89
 from the rest of the C++ retrieval pipeline (134 total, `ctest --test-dir build`). Two real bugs were caught by
 these tests, not by manual review: one function computed the correct "skip to here next" position and then
 returned a placeholder value by mistake instead of using it; a second function read metadata from the wrong

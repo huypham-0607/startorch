@@ -12,9 +12,9 @@
  * rather than the drive.
  */
 
-#include "startorch/retrieval/construct_doc_len_list.h"
-#include "startorch/retrieval/merge_inverted_blocks.h"
-#include "startorch/retrieval/token_stream.h"
+#include "startorch/lexical/construct_doc_len_list.h"
+#include "startorch/lexical/merge_inverted_blocks.h"
+#include "startorch/lexical/token_stream.h"
 #include "startorch/utils/file_io.h"
 #include "startorch/utils/vbe.h"
 

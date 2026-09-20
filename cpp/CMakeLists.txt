@@ -51,15 +51,15 @@ set(STARTORCH_SOURCES
     src/utils/logger.cpp
     src/utils/vbe.cpp
     src/utils/file_io.cpp
-    src/retrieval/posting_list.cpp
-    src/retrieval/bm25.cpp
-    src/retrieval/token_stream.cpp
-    src/retrieval/construct_inverted_blocks.cpp
-    src/retrieval/construct_doc_len_list.cpp
-    src/retrieval/merge_inverted_blocks.cpp
-    src/retrieval/build_params.cpp
-    src/retrieval/build_index.cpp
-    src/retrieval/query_engine.cpp
+    src/lexical/posting_list.cpp
+    src/lexical/bm25.cpp
+    src/lexical/token_stream.cpp
+    src/lexical/construct_inverted_blocks.cpp
+    src/lexical/construct_doc_len_list.cpp
+    src/lexical/merge_inverted_blocks.cpp
+    src/lexical/build_params.cpp
+    src/lexical/build_index.cpp
+    src/lexical/query_engine.cpp
 )
 
 # Building a library startorch_core compiled from STARTORCH_SOURCES.
@@ -69,14 +69,6 @@ add_library(startorch_core ${STARTORCH_SOURCES})
 target_include_directories(startorch_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-
-# Adding CLI entry points (apps/)
-add_executable(build_inverted_blocks apps/build_inverted_blocks.cpp)
-target_link_libraries(build_inverted_blocks PRIVATE startorch_core)
-add_executable(build_doc_len_list apps/build_doc_len_list.cpp)
-target_link_libraries(build_doc_len_list PRIVATE startorch_core)
-add_executable(merge_inverted_blocks apps/merge_inverted_blocks.cpp)
-target_link_libraries(merge_inverted_blocks PRIVATE startorch_core)
 
 # Benchmarks (not tests): compare the stdio readers with BufferedReader.
 add_executable(io_bench benchmarks/io_bench.cpp)
@@ -97,25 +89,25 @@ target_link_libraries(vbe_tests PRIVATE startorch_core GTest::gtest_main)
 add_executable(file_io_tests tests/utils/file_io_tests.cpp)
 target_link_libraries(file_io_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(posting_list_tests tests/retrieval/posting_list_tests.cpp)
+add_executable(posting_list_tests tests/lexical/posting_list_tests.cpp)
 target_link_libraries(posting_list_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(bm25_tests tests/retrieval/bm25_tests.cpp)
+add_executable(bm25_tests tests/lexical/bm25_tests.cpp)
 target_link_libraries(bm25_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(token_stream_tests tests/retrieval/token_stream_tests.cpp)
+add_executable(token_stream_tests tests/lexical/token_stream_tests.cpp)
 target_link_libraries(token_stream_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(construct_inverted_blocks_tests tests/retrieval/construct_inverted_blocks_tests.cpp)
+add_executable(construct_inverted_blocks_tests tests/lexical/construct_inverted_blocks_tests.cpp)
 target_link_libraries(construct_inverted_blocks_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(construct_doc_len_list_tests tests/retrieval/construct_doc_len_list_tests.cpp)
+add_executable(construct_doc_len_list_tests tests/lexical/construct_doc_len_list_tests.cpp)
 target_link_libraries(construct_doc_len_list_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(merge_inverted_blocks_tests tests/retrieval/merge_inverted_blocks_tests.cpp)
+add_executable(merge_inverted_blocks_tests tests/lexical/merge_inverted_blocks_tests.cpp)
 target_link_libraries(merge_inverted_blocks_tests PRIVATE startorch_core GTest::gtest_main)
 
-add_executable(query_engine_tests tests/retrieval/query_engine_tests.cpp)
+add_executable(query_engine_tests tests/lexical/query_engine_tests.cpp)
 target_link_libraries(query_engine_tests PRIVATE startorch_core GTest::gtest_main)
 
 pybind11_add_module(startorch_cpp python/bindings.cpp)

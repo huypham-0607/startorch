@@ -100,7 +100,7 @@ Currently, these fields are treated as one flat bag of word model (no field weig
 
 An issue worth flagging, OpenAlex treat topics as a hierarchy of `domains` &rarr;`fields` &rarr; `subfields` &rarr; `topics`. A consolidated research paper might have list of `topics` that share common ancestors at higher level in the hierarchy. This has the potential to skew both BM25 accuracy and BMW pruning effectiveness for common terms.
 
-Tokenization step will be implemented in Python (`tokenizer/tokenizer.py`). Results will be serialized and saved as binary shards `token_*.bin`
+Tokenization step will be implemented in Python (`lexical/tokenizer.py`). Results will be serialized and saved as binary shards `token_*.bin`
 
 We will consider each single word as a token. Hyphen connected words are collapsed an considered a single word. For instance "We value your well-being" will be considered 5 tokens: "We", "value", "your", "well", "being". For the scope of this project, machine learning based tokenization methods are not considered.
 
@@ -121,7 +121,7 @@ During the tokenization process, Python will also produce another artifact - a r
 
 Everything downstream from now on will be written in C++.
 
-**Build pipeline, each with their own file** - (`cpp/src/retrieval/`):
+**Build pipeline, each with their own file** - (`cpp/src/lexical/`):
 
 | Stage | File | Output |
 |---|---|---|
@@ -180,7 +180,7 @@ Block-Max WAND improved upon this by chunking posting lists into blocks (usually
 
 Readers can read more about Block-Max WAND in the original research paper.
 
-The query engine is implemented in `src/retrieval/query_engine.cpp`. Here is quick implementation rundown.
+The query engine is implemented in `src/lexical/query_engine.cpp`. Here is quick implementation rundown.
 
 First, we load all posting & block metadata into memory. Then, each query term gets its own cursor (`PostingPointer`) into that term's posting list. This is implemented by traversing a memory mapped file (for efficiency with non-sequential reads). On every round, the engine sorts the cursors by the document ID, calculating pivot (position where running global WAND score exceeded current top-k threshold). Two optimizations compared to exhaustive search:
 

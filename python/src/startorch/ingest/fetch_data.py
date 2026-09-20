@@ -11,7 +11,9 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from startorch.utils import fetch_one, get_current_time, get_logger
+from startorch.utils.duckdb import fetch_one
+from startorch.utils.logger import get_logger
+from startorch.utils.misc import get_current_time
 from botocore import UNSIGNED
 from botocore.client import Config
 

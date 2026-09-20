@@ -38,9 +38,9 @@ def check(name):
     return wrap
 
 
-@check("import startorch.utils")
+@check("import startorch.utils.misc")
 def _():
-    import startorch.utils  # noqa: F401
+    import startorch.utils.misc  # noqa: F401
 
 
 @check("import startorch.ingest.fetch_data")
@@ -48,14 +48,14 @@ def _():
     import startorch.ingest.fetch_data  # noqa: F401
 
 
-@check("import startorch.works_subset.works_subset")
+@check("import startorch.ingest.works_subset")
 def _():
-    import startorch.works_subset.works_subset  # noqa: F401
+    import startorch.ingest.works_subset  # noqa: F401
 
 
-@check("import startorch.tokenizer.tokenizer")
+@check("import startorch.lexical.tokenizer")
 def _():
-    import startorch.tokenizer.tokenizer  # noqa: F401
+    import startorch.lexical.tokenizer  # noqa: F401
 
 
 @check("import startorch.cli")
@@ -88,7 +88,7 @@ def _():
 
 @check("WorksSubsetter constructs with (full_corpus_path, subset_path, spill_path, filter_condition)")
 def _():
-    from startorch.works_subset.works_subset import WorksSubsetter
+    from startorch.ingest.works_subset import WorksSubsetter
     s = WorksSubsetter(Path("full_corpus"), Path("subset"), Path("spill"), "language = 'en'")
     assert s.full_corpus_path == Path("full_corpus")
     assert s.subset_path == Path("subset")
@@ -106,8 +106,8 @@ def _():
     # validate_database(). Catches SQL typos/invalid syntax in project-config.toml
     # without needing a real subset on disk.
     import duckdb
-    from startorch.paths import profile, profile_names
-    from startorch.utils import fetch_one
+    from startorch.utils.paths import profile, profile_names
+    from startorch.utils.duckdb import fetch_one
 
     profiles = {name: profile(name).filter for name in profile_names("openalex")}
     assert len(profiles) > 0, "no OpenAlex profiles defined"
@@ -175,7 +175,7 @@ def _help_choices(subcommand):
 
 @check("CLI --profile choices match project-config.toml exactly")
 def _():
-    from startorch.paths import profile_names
+    from startorch.utils.paths import profile_names
     assert _help_choices("gen-works-subset") == set(profile_names("openalex"))
     assert _help_choices("build-posting") == set(profile_names())
     assert _help_choices("query") == set(profile_names())
@@ -185,7 +185,7 @@ def _():
 def _():
     # Golden paths: where the indexes, query sets and results live on disk
     # today. A config or paths.py change that moves any of them fails here.
-    from startorch.paths import profile
+    from startorch.utils.paths import profile
     expected = {
         ("full-en", "meta_path"): "/data/scholar_rank/posting/full-en/posting/metadata.bin",
         ("full-en", "lookup_file"): "/data/scholar_rank/posting/full-en/lookup/doc_id_lookup.bin",
@@ -223,7 +223,7 @@ def _():
 def _():
     import tempfile
     import numpy as np
-    from startorch.doc_id_lookup import DocIdLookup, lookup_records
+    from startorch.lexical.doc_id_lookup import DocIdLookup, lookup_records
     raw = np.array([3, 17, 42, 1000, 2**40], dtype=np.int64)
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "doc_id_lookup.bin"
