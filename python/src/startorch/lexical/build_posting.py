@@ -1,6 +1,4 @@
-"""Orchestrate the index build for one profile: tokenize, then build_index in C++.
-
-"""
+"""Builds one profile's index: tokenize in Python, then build_index in C++."""
 
 from startorch._native import startorch_cpp
 from startorch.utils.paths import Profile
@@ -11,14 +9,35 @@ logger = get_logger(__name__)
 
 
 class PostingBuilder:
-    """Builds a profile's index. Paths and build parameters come from its
-    project-config.toml table (see startorch.utils.paths); parameters it doesn't set
-    take BuildParams' defaults in C++."""
+    """Builds a profile's index from its source documents.
+
+    Paths and build parameters come from the profile's project-config.toml table
+    (see startorch.utils.paths); parameters it doesn't set take BuildParams'
+    defaults in C++.
+
+    Attributes:
+        profile: The profile to build.
+    """
 
     def __init__(self, profile: Profile) -> None:
+        """Stores the profile to build; nothing is read until build().
+
+        Args:
+            profile: The profile to build, from startorch.utils.paths.profile().
+        """
         self.profile = profile
 
     def build(self) -> None:
+        """Tokenizes the profile's documents, then builds the index in one C++ pass.
+
+        The tokenizer's DuckDB connection is closed before the C++ build starts,
+        so its memory is not held through the build.
+
+        Raises:
+            ValueError: If a build parameter is out of range, or a token is
+                longer than 65,535 bytes.
+            RuntimeError: If the C++ build cannot read or write its files.
+        """
         p = self.profile
         tokenizer = Tokenizer()
         try:

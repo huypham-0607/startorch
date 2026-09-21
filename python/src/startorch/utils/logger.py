@@ -1,16 +1,20 @@
+"""Logger factory shared by every module in the package."""
+
 import logging
 import sys
 
 
 def get_logger(name: str) -> logging.Logger:
-    """Formatting default logger for general use cases.
+    """Returns a logger that writes timestamped INFO-level lines to stdout.
+
+    The handler is attached only once per name, so calling this repeatedly
+    (for example at import time in several modules) never duplicates output.
 
     Args:
-        name: Name of logger (typically __name__)
+        name: The logger's name, normally the calling module's __name__.
 
     Returns:
-        logging.Logger object with customized formatter.
-
+        The configured logging.Logger.
     """
     logger = logging.getLogger(name)
     if not logger.handlers:

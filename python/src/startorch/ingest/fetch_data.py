@@ -23,7 +23,14 @@ logger = get_logger(__name__)
 class EntityIngestor(ABC):
     """Base class for OpenAlex ingestion. Each entity needs one subclass.
 
-    A subclass sets extracted_columns/columns/entity, and writes the abstract methods.
+    A subclass sets extracted_columns, columns and entity, and implements the
+    abstract methods. Defining a subclass registers it in registry.
+
+    Attributes:
+        extracted_columns: Columns read from each raw shard.
+        columns: Columns expected in each compact shard.
+        entity: The OpenAlex entity name, e.g. "works"; also its S3 folder name.
+        registry: Every subclass, keyed by entity name. Sets the CLI's --entity choices.
     """
 
     extracted_columns: list[str]
@@ -33,16 +40,30 @@ class EntityIngestor(ABC):
 
     @dataclass(kw_only=True)
     class ManifestData:
-        """One entry from a manifest.json file: an S3 key and the raw shard's stats."""
-        key: Path               # Key (path) of the shard on S3, also the local path fragment
-        content_length: int     # Raw file size, in bytes
-        record_count: int       # Number of rows in the shard
+        """One entry from a manifest.json file: an S3 key and the raw shard's stats.
+
+        Attributes:
+            key: Key (path) of the shard on S3, also the local path fragment.
+            content_length: Raw file size, in bytes.
+            record_count: Number of rows in the shard.
+        """
+        key: Path
+        content_length: int
+        record_count: int
 
     def __init_subclass__(cls, **kwargs):
+        """Registers each subclass in EntityIngestor.registry under its entity name."""
         super().__init_subclass__(**kwargs)
         EntityIngestor.registry[cls.entity] = cls
 
     def __init__(self, upstream_prefix: Path, raw_path: Path, compact_path: Path):
+        """Stores the corpus locations; nothing is fetched until orchestrate().
+
+        Args:
+            upstream_prefix: Snapshot prefix in the OpenAlex S3 bucket.
+            raw_path: Folder for downloaded raw shards.
+            compact_path: Root folder for the compact output.
+        """
         self.upstream_prefix = upstream_prefix
         self.raw_path = raw_path
         self.compact_path = compact_path
@@ -50,6 +71,7 @@ class EntityIngestor(ABC):
     @property
     @abstractmethod
     def entity(self) -> str:
+        """The OpenAlex entity name, e.g. "works". Subclasses set it as a class attribute."""
         raise NotImplementedError
 
     def get_manifest_data(self, manifest_path: Path) -> list:
@@ -62,8 +84,9 @@ class EntityIngestor(ABC):
             A list of ManifestData, one per shard in the manifest.
 
         Raises:
-            FileNotFoundError or json.JSONDecodeError if the file is missing or bad.
-            KeyError if the file's format does not match the expected OpenAlex shape.
+            FileNotFoundError: If the manifest file is missing.
+            json.JSONDecodeError: If the file is not valid JSON.
+            KeyError: If the file does not have the expected OpenAlex shape.
         """
 
         manifest_data = None
@@ -95,7 +118,9 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            A network or S3 error if the download fails, or OSError if the write fails.
+            botocore.exceptions.ClientError: If S3 rejects the request, e.g. a missing key.
+            botocore.exceptions.BotoCoreError: If the connection to S3 fails.
+            OSError: If the file cannot be written.
         """
 
         s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
@@ -118,7 +143,9 @@ class EntityIngestor(ABC):
             Two lists of ManifestData: local shards, then remote shards.
 
         Raises:
-            Same errors as get_manifest_data.
+            FileNotFoundError: If the manifest file is missing.
+            json.JSONDecodeError: If the file is not valid JSON.
+            KeyError: If the file does not have the expected OpenAlex shape.
         """
 
         data = self.get_manifest_data(manifest_path)
@@ -146,7 +173,9 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            A network or S3 error if the download fails, or OSError if the write fails.
+            botocore.exceptions.ClientError: If S3 rejects the request, e.g. a missing key.
+            botocore.exceptions.BotoCoreError: If the connection to S3 fails.
+            OSError: If the file cannot be written.
         """
 
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +196,7 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            A DuckDB error if the file is missing or not valid parquet.
+            duckdb.Error: If the file is missing or not valid parquet.
         """
         db = duckdb.connect()
         rel = db.read_parquet(shard_path)
@@ -184,7 +213,7 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            OSError if the file exists but cannot be deleted. A missing file is not an error.
+            OSError: If the file exists but cannot be deleted. A missing file is not an error.
         """
 
         shard_path.unlink(missing_ok=True)
@@ -199,7 +228,7 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            OSError if the file cannot be created.
+            OSError: If the file cannot be created.
         """
         try:
             with open(extraction_log_path, "w", encoding="utf-8") as f:
@@ -212,14 +241,14 @@ class EntityIngestor(ABC):
         """Adds one line to the extraction log file.
 
         Args:
-            extraction_log_path: Path to an existing log file.
+            extraction_log_path: Path to the log file. Created if it does not exist.
             message: Text to add. A newline is added after it.
 
         Returns:
             None
 
         Raises:
-            OSError if the file does not exist or cannot be written.
+            OSError: If the file cannot be opened or written.
         """
         try:
             with open(extraction_log_path, "a", encoding="utf-8") as f:
@@ -279,7 +308,7 @@ class EntityIngestor(ABC):
             None
 
         Raises:
-            RuntimeError if 50 or more shards fail their checks.
+            RuntimeError: If 50 or more shards fail their checks.
         """
         upstream_manifest_path = self.upstream_prefix/self.entity/"manifest.json"
         manifest_path = self.raw_path/self.entity/"manifest.json"
@@ -369,7 +398,13 @@ class EntityIngestor(ABC):
 
 
 class WorksIngestor(EntityIngestor):
-    """The Works entity. The only entity class right now."""
+    """Ingests the OpenAlex Works entity, the only entity so far.
+
+    Attributes:
+        extracted_columns: Columns read from each raw Works shard.
+        columns: Columns in each compact shard, which adds authorships_truncated.
+        entity: "works".
+    """
 
     # Columns being extracted from raw shards
     extracted_columns = [
@@ -412,7 +447,19 @@ class WorksIngestor(EntityIngestor):
 
     @dataclass(kw_only=True)
     class _ShardValidationResult:
-        """Holds the raw and compact stats for one shard. Used only inside this class."""
+        """The raw and compact stats for one shard. Used only inside WorksIngestor.
+
+        Attributes:
+            raw_content_length: Raw shard size in bytes, from the manifest.
+            compact_content_length: Compact shard size in bytes.
+            raw_record_count: Raw row count, from the manifest.
+            compact_record_count: Compact row count.
+            link_mismatch_count: Rows whose referenced_works_count differs from
+                the length of referenced_works.
+            is_valid_schema: True if the columns exactly match WorksIngestor.columns.
+            missing_columns: Expected columns the shard lacks.
+            redundant_columns: Columns the shard has but should not.
+        """
         raw_content_length: int
         compact_content_length: int
         raw_record_count: int
@@ -435,7 +482,7 @@ class WorksIngestor(EntityIngestor):
             None
 
         Raises:
-            A DuckDB error if the raw shard's format is not as expected.
+            duckdb.Error: If the raw shard's format is not as expected.
         """
 
         db = duckdb.connect()
@@ -516,7 +563,8 @@ class WorksIngestor(EntityIngestor):
             A _ShardValidationResult with the measured values.
 
         Raises:
-            A DuckDB error, or OSError if shard_path does not exist.
+            duckdb.Error: If the shard cannot be read as parquet.
+            OSError: If shard_path does not exist.
         """
 
         db = duckdb.connect()
@@ -559,7 +607,8 @@ class WorksIngestor(EntityIngestor):
             A list of error messages. An empty list means the shard passed.
 
         Raises:
-            Same errors as _get_shard_validation_result.
+            duckdb.Error: If the shard cannot be read as parquet.
+            OSError: If the compact shard does not exist.
         """
         val_result = self._get_shard_validation_result(
             self.compact_path/file.key,
@@ -607,7 +656,8 @@ class WorksIngestor(EntityIngestor):
             None. Also prints a summary to the screen.
 
         Raises:
-            A DuckDB error, or OSError if compact_path does not exist.
+            duckdb.Error: If a compact shard cannot be read as parquet.
+            OSError: If compact_path does not exist, or a report cannot be written.
         """
 
         files = self.get_manifest_data(manifest_path)

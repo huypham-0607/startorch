@@ -18,9 +18,14 @@ logger = get_logger(__name__)
 
 
 class WorksSubsetter:
-    """Filters full_corpus_path/works by filter_condition, writes the result to subset_path.
+    """Filters the corpus's Works by a condition and writes the matches as a subset.
 
-    full_corpus_path is the corpus root (the folder that holds works/), not works/ itself.
+    Attributes:
+        full_corpus_path: The corpus root, the folder that holds works/, not works/ itself.
+        subset_path: Where the subset's parquet files are written.
+        spill_path: DuckDB's spill directory for work that exceeds memory.
+        filter_condition: The SQL condition selecting the subset's works.
+        rows_per_chunk: Target rows per output file.
     """
 
     def __init__(
@@ -31,6 +36,15 @@ class WorksSubsetter:
         filter_condition: str,
         rows_per_chunk: int = 2000000
     ):
+        """Stores the subset's configuration; nothing is read until a method runs.
+
+        Args:
+            full_corpus_path: The corpus root, the folder that holds works/.
+            subset_path: Where the subset's parquet files go.
+            spill_path: DuckDB's spill directory.
+            filter_condition: The SQL condition selecting the subset's works.
+            rows_per_chunk: Target rows per output file.
+        """
         logger.info("Initializing WorksSubsetter.")
 
         self.full_corpus_path = full_corpus_path
@@ -42,10 +56,17 @@ class WorksSubsetter:
         logger.info("Finished initializing WorksSubsetter.")
 
     def _corpus_glob(self) -> str:
+        """Returns a glob matching every Works parquet file in the corpus."""
         return f"{self.full_corpus_path}/works/**/*.parquet"
 
     def count_matching(self) -> int:
-        """Works in the full corpus matching the filter. Reads only the filter's columns."""
+        """Counts the corpus's works that match the filter.
+
+        Reads only the columns the filter uses, so it is much cheaper than a copy.
+
+        Returns:
+            The number of matching works.
+        """
         con = db.connect(config={"temp_directory": str(self.spill_path)})
         return fetch_one(con.sql(f"""
             SELECT count(*) FROM read_parquet('{self._corpus_glob()}') WHERE {self.filter_condition}
@@ -64,6 +85,9 @@ class WorksSubsetter:
         Missing entries = corpus count - subset rows. That is exact: the subset
         was copied from the corpus, its ids are distinct, and every row matches
         the filter, so equal counts mean equal sets.
+
+        Raises:
+            OSError: If the validation log cannot be written.
         """
         con = db.connect(config={"temp_directory": str(self.spill_path)})
 
@@ -107,7 +131,10 @@ class WorksSubsetter:
             raise
 
     def subset_database(self):
-        """Filters full_corpus_path/works by filter_condition, writes subset_path in chunks."""
+        """Copies the corpus's matching works into subset_path as zstd parquet files.
+
+        Row order is not preserved; nothing downstream depends on it.
+        """
         logger.info("Connecting to DB.")
         self.subset_path.mkdir(parents=True, exist_ok=True)
 
@@ -144,9 +171,12 @@ class WorksSubsetter:
 
 
 def main():
-    """Dev entry point: validate one copied profile's existing subset.
+    """Validates one materialized profile's existing subset. A development entry point.
 
-    python -m startorch.ingest.works_subset [profile]   (default math-en)
+    Usage: python -m startorch.ingest.works_subset [profile], default math-en.
+
+    Raises:
+        SystemExit: If the profile is not materialized, so there is nothing to validate.
     """
     from startorch.utils.paths import corpus_paths, profile
 

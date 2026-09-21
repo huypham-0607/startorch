@@ -1,33 +1,76 @@
 # Deploying Startorch as a live search service (EC2 + S3)
 
-A staged plan from "a local CLI that queries an index on `/data`" to "a URL that answers search requests".
-Each step gives the goal, a high-level outline, and terms to research. No code here on purpose: the point is
-to know what to build and what to read before building it.
+A plan to put the query engine behind a URL, sized for **a small number of users** — a portfolio demo, a few
+friends, an occasional reviewer. Not a product launch.
 
-Written against the project state on 2026-09-19.
+Two rules shaped it: **write as little as possible**, and **depend on as little as possible**. Those pull
+against each other, so where a managed service costs real money or real setup time, this picks the boring
+option that ships.
+
+Written against the project state on 2026-09-20. Check current docs before pinning versions.
 
 ---
 
-## 0. Where the project stands today
+## The whole stack
+
+| Concern | Choice | Notes |
+|---|---|---|
+| HTTP API | **FastAPI** + **Uvicorn** | the only two Python packages added |
+| Validation, caps | **FastAPI's `Query` constraints** | comes with FastAPI, no extra package |
+| Concurrency limit | **`threading.Semaphore`** or anyio's limiter | stdlib, or already installed with FastAPI |
+| Result cache | **`functools.lru_cache`** | stdlib |
+| Build + run | **Docker** multi-stage build, **Docker Compose** | compiles the C++ in a builder stage, ships a slim runtime; the index stays outside the image |
+| TLS + reverse proxy | **Caddy**, as the second Compose service | automatic Let's Encrypt certificates, ~4 lines of config |
+| Process supervision | **systemd** unit running Compose | already on the machine |
+| Index storage | **S3**, copied to an EBS volume with the **AWS CLI** | CLI preinstalled on Amazon Linux |
+| Machine | **one EC2 instance**, 16 GiB RAM | plus an AMI snapshot once it works |
+| Shell access | **SSM Session Manager** | agent preinstalled, no SSH keys or port 22 |
+| Logs | **journald** (`journalctl -u startorch`) | already there |
+| Uptime check | a **free external monitor** hitting `/healthz` | UptimeRobot, Better Stack, or similar |
+| Cost safety | **AWS Budgets** alarm | free, set it first |
+| Load test | **the existing `bmw_performance.py`** | already written |
+
+New things to install: two pip packages, plus Docker on the instance. Caddy arrives as an image rather than a
+binary you manage. Everything else is the OS, AWS, or code you have.
+
+---
+
+## What this drops, and when to add it back
+
+| Dropped | Why it's fine at small scale | Add it back when |
+|---|---|---|
+| Metadata store (titles, authors) | Return OpenAlex ids; the client resolves them from the OpenAlex API | you need titles without a second request, or results must work offline |
+| A registry (ECR/GHCR), scikit-build-core | Build the image on the instance itself. Docker stays: it pins the build environment, and learning it is a goal of this project | you want builds off the box, or a second machine needs to pull the image |
+| Terraform, Packer | One instance, set up once, captured as an AMI | you rebuild the environment more than a couple of times |
+| ALB, ACM, Route 53 | Caddy terminates TLS on the box and renews certificates itself | you need more than one instance behind one name |
+| WAF, CloudFront | In-app caps plus a cache; Cloudflare's free tier if abuse appears | you get real traffic, or real abuse |
+| OpenTelemetry, CloudWatch agent, structlog | journald plus one uptime check | you need to debug slowness you cannot reproduce |
+| GitHub Actions, OIDC deploys | `git pull && systemctl restart startorch` | more than one person deploys |
+| Blue/green index refresh | Stop, swap, start: about a minute of downtime, quarterly | downtime becomes visible to someone who matters |
+| Multiple workers, autoscaling | One process, one instance | one instance genuinely saturates |
+
+**What this costs you:** a single point of failure, about a minute of downtime on each restart (the index load),
+and no horizontal scale. All acceptable for a demo, none acceptable for a product.
+
+---
+
+## Where the project stands today
 
 **What already works**
 
-- `Searcher` loads one index and answers queries in-process (`python/src/startorch/search.py`).
+- `Searcher` loads one index and answers queries in-process (`python/src/startorch/lexical/search.py`).
 - `QueryEngine` (C++, pybind11) does Block-Max WAND top-k BM25 and returns `(score, mapped_id)`.
 - `DocIdLookup` maps those back to OpenAlex ids.
-- `boto3` is already a dependency, so S3 access needs no new packages.
 
-**What serving needs that does not exist yet**
+**What serving still needs**
 
-| Gap | Why it matters for a server |
+| Gap | Why it matters |
 |---|---|
 | No HTTP layer | Nothing accepts a request. `cli.py` prints to stdout. |
-| The bindings never release the GIL | Two requests cannot run queries at the same time in one process. See step 2. |
-| Results carry ids and scores only | A search page needs titles, authors and years. The index stores none of them. See step 3. |
-| Query tokenization runs through DuckDB | The server process must carry DuckDB plus its `fts` extension, and pay that cost per query. |
-| No limits anywhere | `k`, query length and request rate are all unbounded. A public endpoint will be abused. |
+| The bindings never release the GIL | Two requests cannot search at the same time. See step 2. |
+| No limits | `k`, query length and request rate are unbounded. |
 
-**Numbers that drive every sizing decision** (measured 2026-09-19, full-en)
+**Numbers that drive the sizing** (measured 2026-09-19, full-en)
 
 | Quantity | Value |
 |---|---|
@@ -35,261 +78,168 @@ Written against the project state on 2026-09-19.
 | Files *not* needed to serve | `token_stream/` (~220 GB), `posting/partial/` — build inputs only |
 | Heap after load | 6.7 GiB |
 | Heap peak during load | 8.7 GiB |
-| Load time | 14 s with a warm page cache; budget more from cold storage |
-| Posting pages touched per 200 queries | 0.25 GiB (rare terms) to 12.7 GiB (very common) |
+| Load time | 14 s warm; longer from a cold disk |
 
-So: one instance, at least 16 GiB of RAM, about 70 GB of fast disk, and a slow start. That shape decides
-most of what follows.
+So: one instance, 16 GiB of RAM, about 70 GB of disk, and a slow start.
 
 ---
 
-## Phase A — make the engine serveable (all local, before any AWS spend)
+## Step 1. Wrap `Searcher` in FastAPI
 
-### Step 1. Put an HTTP layer around `Searcher`
+**Goal.** `GET /search?q=...&k=10` returns JSON, index loaded once at startup.
 
-**Goal.** `GET /search?q=...&k=10` returns JSON, with the index loaded exactly once at startup.
+- Build the `Searcher` in FastAPI's **lifespan handler** and keep it on `app.state`. Never per request.
+- `k: int = Query(10, ge=1, le=100)` and a max query length. Validation and the 422 response are free.
+- Three routes: `/search`, `/healthz` (process alive), `/readyz` (index loaded).
+- Return the search time the engine already reports, so latency is visible without a profiler.
+- Cache with `@lru_cache(maxsize=1024)` on `(query, k)`. Real traffic repeats.
 
-**Outline.**
-- One process holds one `Searcher` created at startup, not per request. Loading costs 14 s and 6.7 GiB.
-- Endpoints worth having from the start: `/search`, `/healthz` (process alive), `/readyz` (index loaded).
-  The split matters later, because the load balancer must not send traffic during those first seconds.
-- Return the search time your engine already measures, alongside the results, so latency is visible from
-  outside without a profiler.
-- Cap `k` server-side and reject over-long queries. Treat any client-supplied number as hostile.
+**Research.** FastAPI lifespan events, `app.state`, `Query` constraints, `functools.lru_cache`.
 
-**Research.** FastAPI, ASGI vs WSGI, uvicorn, lifespan/startup events, Pydantic request validation,
-health check vs readiness check, HTTP status codes for rejected input (400 vs 422).
+## Step 2. Decide how concurrency works
 
-### Step 2. Decide how concurrency works — the most important design decision here
+The one thing no tool decides for you. `cpp/python/bindings.cpp` binds `QueryEngine::query` without
+`py::call_guard<py::gil_scoped_release>`, so the GIL is held for the whole search and one slow query blocks
+everything.
 
-**Why.** `cpp/python/bindings.cpp` binds `QueryEngine::query` with no `py::call_guard<py::gil_scoped_release>`.
-The GIL is therefore held for the whole search. Threads in the server will queue behind each other, and a
-single 1.2 s query on very common terms blocks everything.
+At this scale the cheapest correct answer is:
 
-**Three ways out, with their costs.**
+1. **Add the GIL release** to the `query` bindings — one line of pybind11. First review whether
+   `QueryEngine::query` is safe on several threads: its methods are not `const` and they share the mapped
+   files and the doc-length vector.
+2. **Write the endpoint as `def`, not `async def`.** Starlette then runs it in its threadpool, so searches
+   overlap with no threading code.
+3. **Bound it with a `Semaphore`** of two or three, and return 503 when full. A queue that grows without limit
+   just turns into timeouts.
 
-1. **Release the GIL in the binding.** Cheapest change, but only correct if `QueryEngine::query` is safe to
-   run from several threads at once. Review that first: the query methods are not `const`, and they share the
-   memory-mapped files and the doc-length vector. Read-only sharing is fine; any mutation of engine state is
-   not.
-2. **Several worker processes.** Standard for Python servers, but each process would load its own 6.7 GiB.
-   Two workers will not fit in 16 GiB. If you go this way, preload the index in a parent and `fork`, so the
-   heap is shared copy-on-write and the mapped posting pages are shared by the page cache anyway.
-3. **One worker, an explicit queue, and honest timeouts.** Simplest and predictable. Throughput is then one
-   query at a time, which may be entirely acceptable for a portfolio service.
+If the review in (1) turns up shared mutable state, skip it: keep one search at a time behind the semaphore
+and accept the throughput. At this scale that is a real option, not a compromise.
 
-Decide this before sizing an instance, because options 1 and 2 change how many cores and how much RAM are
-worth paying for.
+**Research.** Python GIL, `gil_scoped_release`, thread safety vs `const`-correctness, Starlette threadpool,
+`asyncio`/`anyio` timeouts.
 
-**Research.** Python GIL, `py::call_guard<py::gil_scoped_release>`, data races vs benign read sharing,
-`const`-correctness and thread safety, gunicorn `preload_app`, copy-on-write after `fork`, uvicorn workers,
-queueing theory basics (utilization vs latency, why a queue explodes near full utilization).
+## Step 3. Results without a metadata store
 
-### Step 3. Decide what a result actually shows
+The index holds ids and scores only. Rather than building a second database of titles, return ids and let the
+caller resolve them:
 
-**Goal.** Turn `(id, score)` into something a person can read.
+- `https://api.openalex.org/works?filter=ids.openalex:W1|W2|...` fetches up to 50 works in one request.
+- Do it in the browser, or server-side in one call per search.
 
-**Outline.**
-- The index deliberately holds no titles. Something else must map doc id to title, authors, year, DOI.
-- Options, cheapest first: a Parquet or DuckDB file of `(id, title, year, ...)` on the same instance, read at
-  query time for the top k only; SQLite with an index on id; a key-value service if you later split serving
-  across machines.
-- Size it before choosing: a few hundred million rows of title text is not small. You may decide to serve
-  metadata only for the corpus you actually expose.
-- This is also where the xpac/deleted-works problem from `CLAUDE.md` becomes visible: if you keep those
-  records in the index, they will appear in results with no working OpenAlex link.
+Two consequences to accept: results depend on OpenAlex being up, and ids deleted since the June 2026 snapshot
+resolve to nothing (see `CLAUDE.md` — that already affects about a sixth of sampled W7 ids). Filtering those
+out of the index is a separate, open decision.
 
-**Research.** Forward index vs inverted index, document store, DuckDB point lookups over Parquet, SQLite
-`mmap_size`, DynamoDB single-table design, key-value store latency budgets.
+**Research.** OpenAlex `ids.openalex` filter, the polite pool and its rate limits, batching lookups.
 
-### Step 4. Make the build reproducible off your machine
+## Step 4. Build the image with Docker
 
-**Goal.** The same binary and environment on the server as locally, without hand-installing anything.
+**Goal.** One image that runs the same on your machine and on the instance.
 
-**Outline.**
-- Your `.so` is built locally against Arch's toolchain and glibc. The server will run Amazon Linux or Ubuntu.
-  Build for the target, not on your laptop.
-- A container is the usual answer: multi-stage build, compile the C++ in a builder stage, copy the `.so` and
-  the Python package into a slim runtime image. It also documents the runtime dependencies (DuckDB and its
-  `fts` extension) whether or not you deploy containers.
-- Keep the index out of the image. It is 56 GB and changes on a different schedule than the code.
-- If you consider Graviton (arm64) for price, note the index files are written in native byte order and
-  native struct sizes. x86_64 and arm64 are both little-endian with the same widths here, but verify by
-  building a small index on both and comparing, rather than assuming.
+**The Dockerfile, in two stages.**
+- *Builder*: a base with a C++20 compiler, CMake and **uv**. Copy `cpp/` and `python/`, run
+  `cmake -S cpp -B cpp/build && cmake --build cpp/build -j`, then `uv sync --frozen`. Add a CMake option to
+  skip the GoogleTest fetch, so server builds don't download a test framework.
+- *Runtime*: a slim Python base. Copy the built package and the `.so` from the builder. No compiler in the
+  final image.
 
-**Research.** Docker multi-stage builds, glibc version compatibility, manylinux, Amazon Linux 2023, ECR,
-AWS Graviton, endianness and struct padding in binary formats, `uv` in containers.
+**Getting the layers right is most of the lesson.** Copy dependency manifests and run `uv sync` *before*
+copying source, so editing a `.py` file doesn't reinstall every package. Put the C++ build after that, since it
+changes less often than Python code but more often than dependencies.
 
----
+**The index never goes in the image.** It is 56 GB, it changes on a different schedule, and an image is not a
+data store. It lives on the host and is bind-mounted read-only (step 5).
 
-## Phase B — index artifacts in S3
+**Two things that bite here specifically.**
+- **Architecture.** Build for the architecture you deploy on. If you develop on x86_64 and deploy on Graviton,
+  use `docker buildx` with `--platform`, and re-verify the index files, which are written in native byte order
+  and native struct sizes.
+- **Build time.** The C++ build inside a fresh image is minutes, not seconds. Use BuildKit's cache mounts for
+  the CMake build directory if iteration gets painful.
 
-### Step 5. Design a versioned bucket layout
+**Research.** Docker multi-stage builds, layer caching and COPY order, `.dockerignore` (exclude `cpp/build/`,
+`.venv/`, `python/.tmp/`), BuildKit cache mounts, `docker buildx --platform`, slim vs distroless base images.
 
-**Goal.** An index build is an immutable artifact you can point servers at, roll forward and roll back.
+## Step 5. Index to S3, then to the instance
 
-**Outline.**
-- One prefix per build, for example `indexes/full-en/2026-09-19/`, holding exactly the serving files from
-  the table above. Never overwrite a live prefix in place.
-- Store a small manifest next to each build: profile, build parameters, document count, checksums, source
-  snapshot date. Your `metadata.txt` is a good start; the snapshot date matters given the corpus drift
-  already recorded in `CLAUDE.md`.
-- Upload with a tool that does multipart and checksums. Verify after upload; a silently truncated posting
-  file fails in ugly ways at query time.
+- Upload the serving files (not `token_stream/`, not `partial/`) to a versioned prefix:
+  `aws s3 sync <dir> s3://<bucket>/indexes/full-en/2026-09-19/`.
+- On the instance, `aws s3 sync` it down to a gp3 volume. About 56 GB, so several minutes.
+- Turn on **S3 versioning** and keep the previous build until the new one has served traffic.
+- Snapshot the data volume once it is populated, so a rebuilt instance skips the download.
 
-**Research.** S3 prefixes and "folders", multipart upload, `aws s3 sync`, S3 object versioning, checksum
-algorithms (`--checksum-algorithm`), S3 Standard vs Standard-IA, lifecycle rules, immutable artifacts,
-blue/green deployment.
+**Do not use Mountpoint for S3 or s3fs.** The engine memory-maps posting files and reads randomly; every page
+fault would become a network round trip.
 
-### Step 6. Get the index onto the instance — and know what not to do
+**Research.** `aws s3 sync`, S3 versioning, EBS gp3 throughput, EBS snapshots, VPC gateway endpoint for S3.
 
-**Goal.** The engine reads local files fast, and a new instance becomes ready without you copying by hand.
+## Step 6. Run it with Compose, behind Caddy
 
-**Outline.**
-- The engine memory-maps posting files and depends on random reads. **Do not try to serve directly from S3.**
-  Mountpoint for Amazon S3 and s3fs exist, and both turn every page fault into a network round trip.
-- Sane options:
-  - **Download at boot** from S3 to a local volume. Simple, and the first boot is slow (56 GB).
-  - **EBS snapshot of a prepared index volume.** Attach a volume created from the snapshot at launch. Faster
-    to a ready state, but blocks are fetched lazily on first touch unless you warm them or pay for Fast
-    Snapshot Restore.
-  - **Instance store NVMe** (i-family). Fastest and cheapest per GB, but the data is gone when the instance
-    stops, so it must be repopulated from S3 at every boot.
-- Whichever you choose, measure the first query after boot separately from steady state. A cold page cache
-  is the difference between 14 s and minutes.
+**Two services in one `compose.yaml`.**
+- `startorch`: your image, running Uvicorn. No published ports — only Caddy reaches it, by service name on the
+  Compose network. Bind-mount the index read-only: `/data/index:/index:ro`.
+- `caddy`: the official image, publishing 80 and 443, proxying to `startorch:8000`. Give it a named volume for
+  `/data`, or it re-requests certificates on every restart and hits Let's Encrypt's rate limits.
 
-**Research.** Mountpoint for Amazon S3 (and why random access is wrong here), EBS gp3 (baseline 3000 IOPS /
-125 MiB/s, provisioned up to higher), EBS snapshots, Fast Snapshot Restore, instance store volumes, EC2 user
-data, cloud-init, page cache warming (`vmtouch`, `fio`), VPC gateway endpoint for S3 (avoids NAT charges).
+**Memory limits are where containers get interesting for this service.** Set `mem_limit` above the 8.7 GiB load
+peak, with headroom — 12 GiB on a 16 GiB machine is a reasonable start. Two things to understand before
+choosing a number:
+- Memory-mapped posting pages are **charged to the container's cgroup**, not treated as free host page cache.
+  The kernel reclaims those clean pages before killing anything, so a query-heavy burst shows as cache churn
+  rather than failure.
+- Set the limit too close to the heap and the container is OOM-killed mid-load. That looks like a mysterious
+  crash with no traceback; check `docker inspect` for `OOMKilled` before debugging anything else.
 
----
+Also set `restart: unless-stopped`, and keep swap off for the container (`memswap_limit` equal to `mem_limit`).
+Swapped heap hurts far more than evicted posting pages.
 
-## Phase C — run it on EC2
+**Supervision.** A small systemd unit runs `docker compose up` on boot, so the stack survives a reboot without
+Docker's restart policy being the only thing holding it together.
 
-### Step 7. Rehearse on a small index first
+**Networking.** Point your domain's A record at the instance's Elastic IP. Security group: 80 and 443 open,
+nothing else. Shell access through SSM Session Manager.
 
-**Goal.** Prove the whole path — build, upload, boot, load, serve, monitor — for a few cents.
+**Research.** Compose service networking and DNS by service name, bind mounts vs named volumes, `mem_limit`
+and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in `docker inspect`, Caddy's
+`/data` volume, systemd units that wrap Compose.
 
-**Outline.**
-- Use msmarco (0.3 GiB of heap) or math-en. Everything except sizing behaves the same.
-- Get a request answered end to end over the public internet before touching full-en.
-- Only then size the real instance.
+## Step 7. Keep it from falling over
 
-**Research.** EC2 instance types t3/t4g, AWS Free Tier limits, SSM Session Manager (shell access without SSH
-keys or open port 22), instance profiles.
+- Caps from step 1 (`k`, query length) plus the semaphore from step 2 do most of the work.
+- Add a request timeout so a pathological query cannot hold a slot forever.
+- If abuse shows up, put **Cloudflare's free tier** in front: DNS, edge caching, and rate limiting at no cost,
+  and it hides the origin address. That is the one dependency worth adding under pressure.
 
-### Step 8. Size and launch the full-en instance
+**Research.** Cloudflare proxied DNS, rate limiting rules, `Cache-Control`, request timeouts in Uvicorn.
 
-**Goal.** An instance that holds the working set without swapping.
+## Step 8. Minimal operations
 
-**Outline.**
-- RAM: 6.7 GiB of heap plus room for posting pages. 16 GiB works but leaves common-term queries reading from
-  disk; 32 GiB is comfortable. Memory-optimized (r-family) is the natural family.
-- Disk: about 70 GB for the index, plus the OS. Throughput matters more than capacity for load time.
-- Turn swap off, or keep the service out of swap. Swapped heap is far worse than evicted posting pages: the
-  doc lengths and block metadata are touched on every query.
-- Run the service under a process supervisor so it restarts on failure and starts on boot.
-- Keep the instance in a private subnet with no public IP. Reach it through Session Manager.
-
-**Research.** EC2 r7i/r7g families, on-demand vs Spot vs Savings Plans, `vm.swappiness`, systemd unit files
-and `Restart=`, `MemoryMax` and `MemorySwapMax` in systemd, VPC public vs private subnets, security groups
-vs NACLs, IAM instance profile, least privilege for the S3 read path.
-
----
-
-## Phase D — make it a public service
-
-### Step 9. Front door: load balancer, TLS, domain
-
-**Goal.** `https://search.yourdomain.com` reaches the instance safely.
-
-**Outline.**
-- Put an Application Load Balancer in front, terminating TLS with a free ACM certificate. The instance itself
-  never faces the internet and accepts traffic only from the balancer's security group.
-- Point a Route 53 record at the balancer.
-- Configure the health check against `/readyz`, with a grace period longer than the index load, and make
-  deregistration wait for in-flight queries.
-
-**Research.** Application Load Balancer, target groups, health check grace period, deregistration delay, AWS
-Certificate Manager, Route 53 alias records, HTTP to HTTPS redirect, security group chaining.
-
-### Step 10. Protect it from load and from cost
-
-**Goal.** One person with a script cannot exhaust the machine or your budget.
-
-**Outline.**
-- Rate-limit per IP at the edge. A single very common query already costs about a second of CPU.
-- Enforce server-side caps: maximum `k`, maximum query length, request timeout, and a bound on concurrent
-  queries.
-- Cache. Real query traffic is heavily repeated, and an in-process LRU of `(query, k)` results is a few lines
-  with a large effect. A CDN in front can cache identical URLs outright.
-- Set a budget alarm on day one, before the first full-size instance runs overnight.
-
-**Research.** AWS WAF rate-based rules, CloudFront caching and cache keys, `Cache-Control`, LRU caches,
-bulkhead and timeout patterns, AWS Budgets and Cost Anomaly Detection, AWS Pricing Calculator.
-
-### Step 11. See what it is doing
-
-**Goal.** Answer "is it up, how fast is it, and why did it get slow" without logging in.
-
-**Outline.**
-- Ship application logs and metrics: queries per second, latency percentiles (p50/p95/p99, not averages),
-  error rate, cache hit rate, index load time at startup.
-- EC2 does not report memory usage by default. Install the CloudWatch agent if you want to see the very thing
-  that constrains this service.
-- Alarm on the few things that mean real trouble: readiness failing, swap in use, p99 latency, 5xx rate.
-
-**Research.** CloudWatch agent, custom metrics, embedded metric format, log groups and retention, percentile
-statistics, alarms and composite alarms, structured logging.
-
----
-
-## Phase E — keep it running
-
-### Step 12. Refresh the index without downtime
-
-**Goal.** Ship a new corpus build without a maintenance window.
-
-**Outline.**
-- Build offline (locally, or on a Spot instance), upload to a new S3 prefix, bring up a second instance on the
-  new prefix, wait for readiness, then switch the target group and retire the old one.
-- Keep the previous build in S3 until the new one has served real traffic.
-- The corpus itself only changes quarterly (see `CLAUDE.md`), so this runs rarely. That is an argument for
-  keeping it manual and documented rather than automated early.
-
-**Research.** Blue/green deployment, immutable infrastructure, EC2 Spot interruptions and checkpointing,
-launch templates, AMI baking with Packer or EC2 Image Builder.
-
-### Step 13. Write the infrastructure down
-
-**Goal.** Rebuild the whole environment from a file, not from memory of console clicks.
-
-**Outline.**
-- Click through the console once to learn the pieces, then capture the result as code.
-- Store non-secret settings (bucket, prefix, profile name) outside the image so the same artifact runs in
-  staging and production.
-
-**Research.** Terraform or AWS CDK or CloudFormation, SSM Parameter Store, twelve-factor configuration,
-tagging strategy for cost allocation.
+- **Logs:** `journalctl -u startorch -f`. Uvicorn's access log is enough to see traffic and errors.
+- **Uptime:** a free external monitor pinging `/healthz` every few minutes, alerting by email.
+- **Cost:** an AWS Budgets alarm, set before the first full-size instance runs overnight. A 16 GiB instance
+  running 24/7 is the dominant cost; stopping it when not in use is the simplest saving, and an Elastic IP plus
+  the EBS volume keep the setup intact while stopped.
+- **Load test:** point the existing `bmw_performance.py` at the deployed URL's underlying profile, or use
+  `hey`/`ab` against `/search`, before showing it to anyone.
+- **Deploy:** `git pull`, `docker compose build`, `docker compose up -d`. Compose recreates only what changed.
+  About a minute of downtime while the index reloads.
+- **Container logs:** `docker compose logs -f startorch`, which journald still captures underneath.
 
 ---
 
 ## Anti-patterns to avoid
 
-- **Memory-mapping posting files straight from S3.** Random access over the network; the pruning algorithm
-  makes it worse, not better.
-- **Autoscaling this service on CPU.** A new instance needs tens of seconds and 56 GB before it can answer
-  anything. Scale by adding pre-warmed instances deliberately, not reactively.
-- **Several worker processes each loading their own copy of the index.** Check the arithmetic against RAM
-  first.
-- **A public IP on the instance with the service port open.** Load balancer in front, instance private.
-- **Shipping `token_stream/` or `posting/partial/` to the server.** They are build inputs, several times the
-  size of what serving needs.
+- **Memory-mapping posting files from S3** (Mountpoint, s3fs). Random access over the network.
+- **Autoscaling.** A new instance needs tens of seconds and 56 GB before it can answer anything.
+- **Several worker processes**, each loading its own 6.7 GiB.
+- **Exposing Uvicorn directly.** Caddy in front; the app container publishes no ports.
+- **Baking the index into the image.** 56 GB, a different release cadence, and every rebuild would copy it.
+  Bind-mount it read-only.
+- **Shipping `token_stream/` or `posting/partial/`.** Build inputs, several times the size of what serving needs.
 
 ## Decisions to make before writing code
 
-1. Concurrency model (step 2) — this one constrains instance size, cost and the API's behavior under load.
-2. Whether results show metadata, and where that metadata lives (step 3).
+1. GIL release, or one search at a time behind a semaphore (step 2).
+2. Client-side id resolution, or a metadata store after all (step 3).
 3. Whether xpac and deleted works stay in the served index (see `CLAUDE.md`).
-4. Storage mode: download at boot, EBS snapshot, or instance store (step 6).
-5. Budget ceiling, and whether the service runs 24/7 or only when you are showing it.
+4. Instance running 24/7, or started when you need to demo it.

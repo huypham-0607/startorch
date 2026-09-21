@@ -4,6 +4,9 @@ Every corpus goes through the same tokenizer. A source query supplies
 (raw_id BIGINT, text VARCHAR) rows; see openalex_source, msmarco_source and
 profile_source. Documents and queries share one token expression, so they are
 tokenized identically.
+
+Attributes:
+    STOP_WORDS: Regex of English stopwords, removed before splitting into tokens.
 """
 
 import duckdb as db
@@ -28,8 +31,18 @@ STOP_WORDS = r"\b(i|me|my|myself|we|our|ours|ourselves|you|your|yours|yourself|y
 
 
 def token_expression(text_sql: str) -> str:
-    """DuckDB expression turning a text value into its token list: lowercase,
-    strip stopwords, split into [a-z0-9]+ words, stem."""
+    """Returns a DuckDB expression that turns a text value into its token list.
+
+    The expression lowercases, strips stopwords, splits into [a-z0-9]+ words,
+    and applies DuckDB's English stemmer.
+
+    Args:
+        text_sql: A SQL expression or parameter yielding the text, e.g. "text"
+            or "$query".
+
+    Returns:
+        A SQL expression producing a list of tokens.
+    """
     return f"""list_transform(
         regexp_extract_all(
             regexp_replace(lower({text_sql}), '{STOP_WORDS}', ' ', 'g'),
@@ -40,7 +53,18 @@ def token_expression(text_sql: str) -> str:
 
 
 def openalex_source(parquet_glob: str, condition: str | None = None) -> str:
-    """Works rows: numeric OpenAlex id, and title + topic hierarchy + keywords as text."""
+    """Returns a source query over OpenAlex Works parquet files.
+
+    Each row is the numeric OpenAlex id and one text field: the title, the topic
+    hierarchy (topic, subfield, field, domain) and the keywords.
+
+    Args:
+        parquet_glob: Glob of Works parquet files, from a subset or the full corpus.
+        condition: Optional SQL condition selecting which works to include.
+
+    Returns:
+        A SQL query yielding (raw_id BIGINT, text VARCHAR) rows.
+    """
     where = f"WHERE {condition}" if condition else ""
     return f"""
         SELECT
@@ -59,7 +83,14 @@ def openalex_source(parquet_glob: str, condition: str | None = None) -> str:
 
 
 def msmarco_source(collection: Path) -> str:
-    """MS MARCO passage rows: pid, and the passage as text."""
+    """Returns a source query over the MS MARCO passage collection.
+
+    Args:
+        collection: Path to collection.tsv, one (pid, passage) row per line.
+
+    Returns:
+        A SQL query yielding (raw_id BIGINT, text VARCHAR) rows.
+    """
     return f"""
         SELECT pid::BIGINT AS raw_id, coalesce(passage, '') AS text
         FROM read_csv('{collection}', header=False, sep='\t', names=['pid', 'passage'])
@@ -67,8 +98,17 @@ def msmarco_source(collection: Path) -> str:
 
 
 def profile_source(profile: Profile) -> str:
-    """The source query for a profile: MS MARCO's collection, a copied OpenAlex
-    subset, or the OpenAlex corpus read through the profile's filter."""
+    """Returns the source query for a profile's documents.
+
+    MS MARCO reads its collection. An OpenAlex profile reads its copied subset if
+    it is materialized, and otherwise the full corpus through its filter.
+
+    Args:
+        profile: The profile whose documents to tokenize.
+
+    Returns:
+        A SQL query yielding (raw_id BIGINT, text VARCHAR) rows.
+    """
     if profile.kind == "msmarco":
         assert profile.collection is not None, f"MS MARCO profile {profile.name} has no collection"
         return msmarco_source(profile.collection)
@@ -79,19 +119,40 @@ def profile_source(profile: Profile) -> str:
 
 
 class Tokenizer:
+    """Tokenizes documents and queries through one in-memory DuckDB connection.
+
+    Documents and queries share token_expression(), so a query is tokenized
+    exactly the way the indexed documents were.
+
+    Attributes:
+        stop_word_list: The stopword regex applied before splitting.
+        con: The DuckDB connection every tokenizing query runs on.
+    """
 
     def __init__(
         self
     ):
+        """Opens an in-memory DuckDB connection."""
         self.stop_word_list = STOP_WORDS
         self.con = db.connect()
 
     def close(self) -> None:
-        """Release DuckDB's memory, e.g. before the C++ build runs in this process."""
+        """Closes the DuckDB connection, releasing its memory.
+
+        Call this before the C++ build runs in the same process.
+        """
         self.con.close()
 
     @staticmethod
     def token_stream_file_name(idx: int) -> str:
+        """Returns the file name of one token stream file.
+
+        Args:
+            idx: Zero-based file index.
+
+        Returns:
+            A name like "token_0007.bin".
+        """
         return f"token_{idx:04d}.bin"
 
     def build_doc_id_lookup(
@@ -100,16 +161,24 @@ class Tokenizer:
         lookup_file: Path,
         row_per_chunk: int
     ) -> np.ndarray:
-        """Rank raw_id into a dense mapped_id in [0,N).
+        """Ranks every raw_id into a dense mapped_id in [0, N) and writes the lookup.
 
         raw_id is sparse and can exceed int32, so downstream structures
         (posting lists, doc lengths, graph adjacency) index by mapped_id
         instead, giving them O(1) flat-array access. mapped_id is the rank of
-        raw_id, so only the ids are sorted. Writes lookup_file (format in
-        startorch.lexical.doc_id_lookup).
+        raw_id, so only the ids are sorted. The file format is defined in
+        startorch.lexical.doc_id_lookup.
+
+        Args:
+            source_sql: A source query yielding (raw_id, text) rows.
+            lookup_file: Where to write doc_id_lookup.bin.
+            row_per_chunk: Rows fetched from DuckDB per batch.
 
         Returns:
             Every raw_id in ascending order, so raw_ids[mapped_id] == raw_id.
+
+        Raises:
+            RuntimeError: If the raw ids are not unique.
         """
         logger.info(f"Building doc_id lookup table.")
 
@@ -139,18 +208,21 @@ class Tokenizer:
 
     @staticmethod
     def encode_token_records(tokens: pa.ListArray, mapped_ids: np.ndarray) -> tuple[pa.Buffer, int, int]:
-        """Pack one batch of documents into token-stream records.
+        """Packs one batch of documents into token-stream records.
 
         Record layout (read_token in C++): little-endian int64 doc_id, uint16
         byte length, then the token's UTF-8 bytes. A document's tokens stay
         contiguous, which the C++ build relies on.
 
         Args:
-            tokens: one list of token strings per document.
-            mapped_ids: each document's mapped_id, aligned with tokens.
+            tokens: One list of token strings per document.
+            mapped_ids: Each document's mapped_id, aligned with tokens.
 
         Returns:
-            (record bytes, token count, longest token in bytes).
+            The record bytes, the token count, and the longest token in bytes.
+
+        Raises:
+            ValueError: If a token is longer than 65,535 bytes.
         """
         counts = pc.list_value_length(tokens).fill_null(0).to_numpy(zero_copy_only=False)
         flat = pc.list_flatten(tokens)
@@ -186,7 +258,7 @@ class Tokenizer:
         chunk_per_file: int = (1<<8),
         docs_per_batch: int = 50_000
     ):
-        """Write the doc_id lookup and every document's tokens as a binary token stream.
+        """Writes the doc_id lookup, then every document's tokens as a token stream.
 
         Documents are streamed in batches with no sort, join, or temp table,
         in whatever order DuckDB's scan threads produce them: the C++ build
@@ -198,6 +270,20 @@ class Tokenizer:
         A new token file starts once the current one holds
         row_per_chunk * chunk_per_file tokens. Token files left in out_path by
         an earlier run are removed first, so none of them reach the build.
+
+        Args:
+            source_sql: A source query yielding (raw_id, text) rows.
+            out_path: Folder for the token_*.bin files.
+            lookup_file: Where to write doc_id_lookup.bin.
+            spill_path: DuckDB's spill directory for work that exceeds memory.
+            row_per_chunk: Rows per DuckDB batch while building the lookup.
+            chunk_per_file: With row_per_chunk, sets the tokens per output file.
+            docs_per_batch: Documents tokenized and written per batch.
+
+        Raises:
+            RuntimeError: If the lookup's raw ids are not unique.
+            KeyError: If a streamed document's raw id is not in the lookup.
+            ValueError: If a token is longer than 65,535 bytes.
         """
         self.con.execute(f"SET temp_directory = '{spill_path}'")
         self.con.sql("INSTALL fts; LOAD fts;")
@@ -259,6 +345,14 @@ class Tokenizer:
         logger.info(f"Max token length = {max_token_length}")
 
     def tokenize_query(self, query: str) -> list[str]:
+        """Tokenizes a query exactly the way documents were tokenized.
+
+        Args:
+            query: Free-text query.
+
+        Returns:
+            The query's stemmed tokens, stopwords removed. May be empty.
+        """
         res = fetch_one(self.con.sql(
             f"SELECT {token_expression('$query')} AS tokens",
             params={"query": query}

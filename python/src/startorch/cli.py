@@ -1,12 +1,13 @@
-"""
-    Supports 4 commands:
-        - ingest
-        - gen-works-subset
-        - build-posting (tokenizer + C++ index build)
-        - query
+"""The startorch command-line interface.
 
-    Every path and build parameter comes from project-config.toml through
-    startorch.utils.paths; this module only parses arguments and dispatches.
+Four commands: ingest, gen-works-subset, build-posting (tokenizer plus the C++
+index build), and query. Every path and build parameter comes from
+project-config.toml through startorch.utils.paths; this module only parses
+arguments and dispatches.
+
+Typical usage example:
+
+    startorch query --query "graph neural networks" --k 10 --profile full-en
 """
 
 import argparse
@@ -19,6 +20,11 @@ from startorch import (
 logger = get_logger(__name__)
 
 def cmd_ingest(args: argparse.Namespace) -> None:
+    """Runs `ingest`: fetches, compacts and checks one OpenAlex entity.
+
+    Args:
+        args: Parsed arguments, with entity and forced_fetch.
+    """
     corpus = corpus_paths()
     ingestor_cls = EntityIngestor.registry[args.entity]
     ingestor = ingestor_cls(
@@ -29,6 +35,14 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     ingestor.orchestrate(forced_fetch=args.forced_fetch)
 
 def cmd_gen_works_subset(args: argparse.Namespace) -> None:
+    """Runs `gen-works-subset` for one OpenAlex profile.
+
+    Copies and validates the subset if the profile is materialized; otherwise
+    only logs how many works its filter matches.
+
+    Args:
+        args: Parsed arguments, with profile.
+    """
     p = profile(args.profile)
     # argparse only offers OpenAlex profiles here, and they always have both.
     assert p.subset_dir is not None and p.filter is not None, f"{p.name} is not an OpenAlex profile"
@@ -41,14 +55,32 @@ def cmd_gen_works_subset(args: argparse.Namespace) -> None:
     subsetter.validate_database()
 
 def cmd_build_posting(args: argparse.Namespace) -> None:
+    """Runs `build-posting`: tokenizes a profile's documents and builds its index.
+
+    Args:
+        args: Parsed arguments, with profile.
+    """
     PostingBuilder(profile(args.profile)).build()
 
 def cmd_query(args: argparse.Namespace) -> None:
+    """Runs `query` and prints one "raw_id score" line per hit, best first.
+
+    Args:
+        args: Parsed arguments, with query, k and profile.
+    """
     result = Searcher(profile(args.profile)).search(args.query, args.k)
     for doc_id, score in result.hits:
         print(f"{doc_id} {score}")
 
 def build_parser() -> argparse.ArgumentParser:
+    """Builds the argument parser, with one subcommand per command.
+
+    Profile choices are read from project-config.toml, so the config must be
+    readable when the parser is built.
+
+    Returns:
+        The parser. Each subcommand sets func to its handler.
+    """
     parser = argparse.ArgumentParser(prog="startorch")
     subparsers = parser.add_subparsers(dest="command", required = True)
 
@@ -113,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    """Parses the command line and runs the chosen command."""
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)

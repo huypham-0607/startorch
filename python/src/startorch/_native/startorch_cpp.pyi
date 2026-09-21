@@ -10,16 +10,28 @@ from os import PathLike
 _Path = str | PathLike[str]
 
 class file_names:
-    """Centralized on-disk naming convention (a submodule at runtime)."""
+    """The on-disk file names shared with the C++ build. A submodule at runtime.
+
+    Attributes:
+        BLOCK_META: Block-Max WAND block metadata file name.
+        METADATA_TXT: Human-readable index metadata file name.
+        METADATA_BIN: Binary index metadata file name, the file QueryEngine opens.
+        DOC_LEN_LIST: Document-length list file name.
+        DOC_LEN_META: Document-length summary file name.
+    """
     BLOCK_META: str
     METADATA_TXT: str
     METADATA_BIN: str
     DOC_LEN_LIST: str
     DOC_LEN_META: str
     @staticmethod
-    def posting_file_name(file_index: int) -> str: ...
+    def posting_file_name(file_index: int) -> str:
+        """Returns the name of the file_index-th posting file."""
+        ...
     @staticmethod
-    def partial_block_file_name(block_index: int) -> str: ...
+    def partial_block_file_name(block_index: int) -> str:
+        """Returns the name of the block_index-th SPIMI partial block."""
+        ...
 
 def build_index(
     token_dir: _Path,
@@ -31,20 +43,71 @@ def build_index(
     split_size: int = ...,
     mem_limit: int = ...,
 ) -> None:
-    """Build a complete index from token_dir, reading it once. Raises ValueError
-    for out-of-range parameters (defaults and ranges live in BuildParams)."""
+    """Builds a complete index from a folder of token files, reading them once.
+
+    Keyword defaults and valid ranges live in BuildParams on the C++ side.
+
+    Args:
+        token_dir: Folder of token_*.bin files, from the tokenizer.
+        partial_dir: Folder for SPIMI partial blocks. Leftover blocks are removed first.
+        out_dir: Folder for the finished index.
+        k1: BM25 term-frequency saturation.
+        b: BM25 document-length normalization.
+        block_size: Postings per Block-Max WAND block.
+        split_size: Maximum bytes per posting file.
+        mem_limit: SPIMI memory budget per partial block, in bytes.
+
+    Raises:
+        ValueError: If a parameter is out of range.
+        RuntimeError: If a file cannot be read or written.
+    """
     ...
 
 class QueryEngine:
-    """An opened index. Loads it once; query repeatedly."""
-    def __init__(self, meta_path: _Path) -> None: ...
+    """An opened index: loaded once, then queried repeatedly."""
+    def __init__(self, meta_path: _Path) -> None:
+        """Loads the index whose metadata.bin is at meta_path.
+
+        Args:
+            meta_path: Path to the index's metadata.bin.
+
+        Raises:
+            RuntimeError: If an index file is missing, or the metadata format is outdated.
+        """
+        ...
     def query(self, terms: list[str], k: int) -> tuple[list[tuple[float, int]], timedelta]:
-        """Block-Max WAND top-k: ((score, mapped doc id) pairs best first, search time)."""
+        """Runs a Block-Max WAND top-k BM25 search.
+
+        Args:
+            terms: Query tokens.
+            k: Number of results to return.
+
+        Returns:
+            (score, mapped doc id) pairs best first, and the search time.
+        """
         ...
     def query_exhaustive(self, terms: list[str], k: int) -> tuple[list[tuple[float, int]], timedelta]:
-        """Same as query, scoring every candidate with no pruning."""
+        """Scores every candidate with no pruning. The ground truth for query().
+
+        Args:
+            terms: Query tokens.
+            k: Number of results to return.
+
+        Returns:
+            The same shape as query(); the results must match it exactly.
+        """
         ...
 
 def read_term_df_mapping(meta_path: _Path) -> list[tuple[str, int]]:
-    """Every indexed term with its document frequency, descending by df."""
+    """Lists every indexed term with its document frequency.
+
+    Args:
+        meta_path: Path to the index's metadata.bin.
+
+    Returns:
+        (term, document frequency) pairs, highest frequency first.
+
+    Raises:
+        RuntimeError: If an index file is missing, or the metadata format is outdated.
+    """
     ...
