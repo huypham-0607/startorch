@@ -1,0 +1,89 @@
+/* Small additions on top of Pico.css; Pico handles the layout and light/dark themes. */
+
+/* Keeps "C++" from breaking across lines. */
+.nowrap {
+    white-space: nowrap;
+}
+
+.brand {
+    font-size: 1.25rem;
+}
+
+#examples {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+#examples span {
+    color: var(--pico-muted-color);
+}
+
+#examples button {
+    width: auto;
+    margin: 0;
+    padding: 0.25rem 0.75rem;
+    font-size: 0.875rem;
+}
+
+#status {
+    color: var(--pico-muted-color);
+    min-height: 1.5rem;
+}
+
+#status.error {
+    color: var(--pico-del-color);
+}
+
+#results {
+    padding: 0;
+}
+
+#results li {
+    list-style: none;
+}
+
+.result article {
+    margin-bottom: 1rem;
+    padding: 1rem 1.25rem;
+}
+
+.result h3 {
+    margin-bottom: 0.25rem;
+    font-size: 1.05rem;
+    line-height: 1.4;
+}
+
+.rank {
+    margin-right: 0.5rem;
+    color: var(--pico-muted-color);
+    font-variant-numeric: tabular-nums;
+}
+
+.meta {
+    margin-bottom: 0.5rem;
+    color: var(--pico-muted-color);
+    font-size: 0.875rem;
+}
+
+.links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 1rem;
+    margin: 0;
+    font-size: 0.8rem;
+}
+
+.score {
+    margin-left: auto;
+    color: var(--pico-muted-color);
+    font-variant-numeric: tabular-nums;
+}
+
+/* Records OpenAlex no longer has, or could not return. */
+.result.missing article {
+    opacity: 0.6;
+}

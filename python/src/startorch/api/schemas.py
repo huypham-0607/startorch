@@ -5,6 +5,8 @@ startorch.lexical, so a change inside Searcher never silently changes what
 clients receive.
 """
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -26,10 +28,12 @@ class SearchResponse(BaseModel):
     Attributes:
         query: The query as received.
         k: The number of results requested.
+        corpus: Which corpus the ids come from. Only "openalex" ids have OpenAlex records.
         took_ms: C++ search time in milliseconds, excluding tokenization and id mapping.
         hits: Up to k results, best first. Empty if no document matches.
     """
     query: str
     k: int
+    corpus: Literal["openalex", "msmarco"] = Field(description="The corpus the ids come from.")
     took_ms: float = Field(description="C++ search time only, in milliseconds.")
     hits: list[Hit]

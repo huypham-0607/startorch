@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Startorch · literature search</title>
+    <meta name="description" content="Search 345 million OpenAlex works with BM25 and Block-Max WAND, written in C++.">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <link rel="stylesheet" href="style.css">
+    <script type="module" src="app.js"></script>
+</head>
+<body>
+    <header class="container">
+        <nav>
+            <ul>
+                <li><strong class="brand">Startorch</strong></li>
+            </ul>
+            <ul>
+                <li><a href="https://github.com/huypham-0607/startorch" target="_blank" rel="noopener">GitHub</a></li>
+                <li><a href="https://github.com/huypham-0607/startorch/blob/main/docs/bmw_technical_report.md" target="_blank" rel="noopener">Technical report</a></li>
+            </ul>
+        </nav>
+        <hgroup>
+            <h1>Literature search over 345M papers</h1>
+            <p>BM25 ranking with a custom Block-Max WAND engine in <span class="nowrap">C++</span>, over the English OpenAlex corpus.</p>
+        </hgroup>
+    </header>
+
+    <main class="container">
+        <form id="search-form" role="search">
+            <input type="search" id="query" name="q" placeholder="Search papers, e.g. Navier-Stokes turbulence"
+                   aria-label="Search query" maxlength="512" autocomplete="off" required>
+            <button type="submit">Search</button>
+        </form>
+        <div id="examples"><span>Try:</span></div>
+        <p id="status" aria-live="polite"></p>
+        <ol id="results"></ol>
+    </main>
+
+    <footer class="container">
+        <details>
+            <summary>How it works</summary>
+            <ul>
+                <li>The query is tokenized and stemmed the same way the 345M indexed works were.</li>
+                <li>A <span class="nowrap">C++</span> engine scores it with BM25, and Block-Max WAND skips blocks of postings that cannot reach the top results.</li>
+                <li>Titles, authors and venues come from the OpenAlex API. Each result links to its OpenAlex record.</li>
+            </ul>
+        </details>
+        <small>Data: <a href="https://openalex.org" target="_blank" rel="noopener">OpenAlex</a>, June 2026 snapshot.</small>
+    </footer>
+</body>
+</html>

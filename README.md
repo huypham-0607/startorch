@@ -61,7 +61,8 @@ The HTTP API works and is tested locally. Deployment to AWS is not started.
 
 It currently supports:
 
-- `/search`, `/healthz`, and `/readyz` endpoints
+- a search page that links each result to its OpenAlex record
+- `/api/search`, `/api/healthz`, and `/api/readyz` endpoints
 - background index loading, so health checks answer during the load
 - up to 4 searches in parallel, on worker threads
 - limits on `k` and query length
@@ -153,6 +154,8 @@ startorch/
 │   ├── python/bindings.cpp             ✅ pybind11 module (startorch_cpp)
 │   ├── tests/                          ✅ 198 GoogleTest cases
 │   └── benchmarks/                     benchmark datasets and future harnesses
+│
+├── frontend/                           ✅ search page: HTML, plain JavaScript, Pico.css
 │
 ├── python/
 │   ├── src/startorch/

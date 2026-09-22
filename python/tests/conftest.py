@@ -26,6 +26,16 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def serve_msmarco():
+    """Pins the API to the msmarco profile, whatever STARTORCH_PROFILE says in the shell."""
+    from startorch.api import api
+    saved = api.PROFILE
+    api.PROFILE = "msmarco"
+    yield
+    api.PROFILE = saved
+
+
 @pytest.fixture(scope="session")
 def searcher():
     """One loaded msmarco Searcher, shared by every test that needs it."""

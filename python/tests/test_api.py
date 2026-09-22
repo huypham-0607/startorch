@@ -20,7 +20,7 @@ def wait_ready(client: TestClient, timeout: float = 60.0) -> None:
     """Polls /readyz until the background load finishes."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if client.get("/readyz").status_code == 200:
+        if client.get("/api/readyz").status_code == 200:
             return
         time.sleep(0.02)
     raise AssertionError("the index never became ready")
@@ -35,12 +35,12 @@ def client():
 
 
 def test_health_endpoints_once_ready(client):
-    assert client.get("/healthz").json() == {"status": "ok"}
-    assert client.get("/readyz").json() == {"status": "ready", "profile": "msmarco"}
+    assert client.get("/api/healthz").json() == {"status": "ok"}
+    assert client.get("/api/readyz").json() == {"status": "ready", "profile": "msmarco"}
 
 
 def test_search_response_shape(client):
-    r = client.get("/search", params={"query": "what is the bm25 ranking function", "k": 5})
+    r = client.get("/api/search", params={"query": "what is the bm25 ranking function", "k": 5})
     assert r.status_code == 200
     body = r.json()
     assert body["query"] == "what is the bm25 ranking function" and body["k"] == 5
@@ -52,7 +52,7 @@ def test_search_response_shape(client):
 
 
 def test_k_defaults_to_10(client):
-    assert len(client.get("/search", params={"query": "ocean temperature"}).json()["hits"]) == 10
+    assert len(client.get("/api/search", params={"query": "ocean temperature"}).json()["hits"]) == 10
 
 
 @pytest.mark.parametrize("params", [
@@ -64,18 +64,20 @@ def test_k_defaults_to_10(client):
     {"query": "a" * (api.MAX_QUERY_LENGTH + 1)},
 ], ids=["k=0", "k>max", "k not int", "no query", "empty query", "query too long"])
 def test_invalid_input_is_rejected(client, params):
-    assert client.get("/search", params=params).status_code == 422
+    assert client.get("/api/search", params=params).status_code == 422
 
 
 def test_stopword_only_query_returns_no_hits(client):
-    r = client.get("/search", params={"query": "the and of"})
+    r = client.get("/api/search", params={"query": "the and of"})
     assert r.status_code == 200 and r.json()["hits"] == []
 
 
-def test_trailing_slash_redirects_to_search(client):
-    r = client.get("/search/", params={"query": "x"}, follow_redirects=False)
-    assert r.status_code == 307
-    assert r.headers["location"].split("?")[0].endswith("/search")
+def test_trailing_slash_is_not_a_second_search_endpoint(client):
+    # Without the page mounted, Starlette redirects /api/search/ (307). With the page
+    # mounted at /, its catch-all matches first and returns 404. Either way,
+    # /api/search is the only search endpoint.
+    r = client.get("/api/search/", params={"query": "x"}, follow_redirects=False)
+    assert r.status_code in (307, 404)
 
 
 def test_openapi_documents_the_response_model(client):
@@ -85,7 +87,7 @@ def test_openapi_documents_the_response_model(client):
 def test_concurrent_searches_match_sequential(client, msmarco_queries):
     """Many requests at once, run on worker threads, must return the sequential results."""
     queries = msmarco_queries[:60]
-    expected = [client.get("/search", params={"query": q, "k": 20}).json()["hits"] for q in queries]
+    expected = [client.get("/api/search", params={"query": q, "k": 20}).json()["hits"] for q in queries]
 
     async def fire_all():
         transport = httpx.ASGITransport(app=api.app)   # the app is already loaded by the fixture
@@ -93,7 +95,7 @@ def test_concurrent_searches_match_sequential(client, msmarco_queries):
             got = [None] * len(queries)
 
             async def one(i):
-                got[i] = (await ac.get("/search", params={"query": queries[i], "k": 20})).json()["hits"]
+                got[i] = (await ac.get("/api/search", params={"query": queries[i], "k": 20})).json()["hits"]
 
             async with anyio.create_task_group() as tg:
                 for i in range(len(queries)):

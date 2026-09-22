@@ -1,32 +1,43 @@
-"""The HTTP API: search over one profile's index, loaded in the background at startup.
+"""The HTTP API and search page: search over one profile's index, loaded in the background.
+
+The API lives under /api. When the repository's frontend/ folder is present, the
+search page is served at /, so `fastapi dev` runs the whole site on one port. In
+production Caddy serves frontend/ itself and proxies only /api to this app.
 
 The server accepts requests as soon as it starts. The index loads on a worker
-thread, so /healthz answers throughout, and /readyz and /search return 503 until
-the load finishes. Searches also run on worker threads, at most
+thread, so /api/healthz answers throughout, and /api/readyz and /api/search
+return 503 until the load finishes. Searches also run on worker threads, at most
 MAX_CONCURRENT_SEARCHES at a time, so a slow search never blocks the event loop.
 Both are possible because the C++ engine releases the GIL while it loads and
 searches, and both it and the tokenizer are thread-safe.
 
+The profile to serve comes from the STARTORCH_PROFILE environment variable,
+msmarco by default.
+
 Typical usage example, from python/:
 
-    fastapi dev src/startorch/api/api.py
+    STARTORCH_PROFILE=full-en fastapi dev src/startorch/api/api.py
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from typing import Annotated
 
 import anyio
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
 
 from startorch.api.schemas import Hit, SearchResponse
 from startorch.lexical.search import Searcher, SearchResult
 from startorch.utils.logger import get_logger
+from startorch.utils.misc import PROJECT_ROOT
 from startorch.utils.paths import profile
 
 logger = get_logger(__name__)
 
-PROFILE = "msmarco"
+PROFILE = os.environ.get("STARTORCH_PROFILE", "msmarco")
+FRONTEND_DIR = PROJECT_ROOT / "frontend"
 MAX_K = 100
 MAX_QUERY_LENGTH = 512
 # Searches are CPU-bound, so more than about one per core only adds queueing.
@@ -76,9 +87,6 @@ async def lifespan(app: FastAPI):
     resources.clear()
 
 
-app = FastAPI(lifespan=lifespan)
-
-
 def _searcher() -> Searcher:
     """Returns the loaded Searcher.
 
@@ -110,18 +118,16 @@ def to_response(query: str, k: int, result: SearchResult, kind: str) -> SearchRe
     return SearchResponse(
         query=query,
         k=k,
+        corpus="openalex" if kind == "openalex" else "msmarco",
         took_ms=result.elapsed.total_seconds() * 1000,
         hits=[Hit(id=f"{prefix}{raw_id}", score=score) for raw_id, score in result.hits],
     )
 
 
-@app.get("/")
-async def root():
-    """Returns a greeting, confirming the app is up."""
-    return {"message": "Hello World"}
+router = APIRouter(prefix="/api")
 
 
-@app.get("/healthz")
+@router.get("/healthz")
 async def healthz():
     """Liveness check: the process is running and can still become ready.
 
@@ -136,7 +142,7 @@ async def healthz():
     return {"status": "ok"}
 
 
-@app.get("/readyz")
+@router.get("/readyz")
 async def readyz():
     """Readiness check: the index is loaded and searches can be served.
 
@@ -150,7 +156,7 @@ async def readyz():
     return {"status": "ready", "profile": PROFILE}
 
 
-@app.get("/search")
+@router.get("/search")
 async def search(
     query: Annotated[str, Query(min_length=1, max_length=MAX_QUERY_LENGTH)],
     k: Annotated[int, Query(ge=1, le=MAX_K)] = 10,
@@ -172,3 +178,12 @@ async def search(
     searcher = _searcher()
     result = await anyio.to_thread.run_sync(searcher.search, query, k, limiter=resources["search_limiter"])
     return to_response(query, k, result, searcher.profile.kind)
+
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(router)
+
+# Mounted last, so /api routes match first. The folder is absent where only the
+# API is deployed (Caddy serves the page there), so the mount is optional.
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

@@ -7,41 +7,48 @@ Two rules shaped it: **write as little as possible**, and **depend on as little 
 against each other, so where a managed service costs real money or real setup time, this picks the boring
 option that ships.
 
-Last updated 2026-09-21. The current status is in the next section. Check current docs before pinning versions.
+Last updated 2026-09-22. The current status is in the next section. Check current docs before pinning versions.
 
 ---
 
 ## Status
 
-**The HTTP API works and is tested locally. Nothing is deployed yet.**
+**The API and the search page work and are tested locally. Nothing is deployed yet.**
 
 | Step | Status | Notes |
 |---|---|---|
-| 1. FastAPI wrapper | Done | `/search`, `/healthz`, `/readyz`. No result cache yet. |
+| 1. FastAPI wrapper | Done | `/api/search`, `/api/healthz`, `/api/readyz`. No result cache yet. |
 | 2. Concurrency | Done | The GIL is released. The engine and tokenizer are thread-safe. 4 searches run at a time. |
-| 3. Results without a metadata store | Done | The API returns OpenAlex ids with the `W` prefix. The client fetches titles. |
-| 4. Docker image | Not started | |
-| 5. Index in S3 | Not started | The full-en and msmarco indexes are built in the current format, ready to upload. |
-| 6. Compose + Caddy | Not started | |
-| 7. Protection | Partly done | Input limits and the search limit are in. No request timeout yet. |
-| 8. Operations | Not started | The health endpoints are ready for an uptime monitor. |
+| 3. Results without a metadata store | Done | The API returns OpenAlex ids with the `W` prefix. The page fetches titles from OpenAlex. |
+| 4. Front end | Done | One static page in `frontend/`, served by FastAPI in development and by Caddy in production. |
+| 5. Docker image | Not started | |
+| 6. Index in S3 | Not started | The full-en and msmarco indexes are built in the current format, ready to upload. |
+| 7. Compose + Caddy | Not started | The Caddy setup, with and without a domain, is planned in step 7. |
+| 8. Protection | Partly done | Input limits and the search limit are in. No request timeout yet. |
+| 9. Operations | Not started | The health endpoints are ready for an uptime monitor. |
 
 ### What works now
 
-- **Endpoints.** `/search?query=&k=` returns `{query, k, took_ms, hits: [{id, score}]}`. `k` must be 1 to 100, and
-  the query 1 to 512 characters. Anything else returns 422.
-- **Background loading.** The server starts at once and loads the index on a worker thread. `/healthz` answers
-  during the load. `/readyz` and `/search` return 503 until the load finishes.
+- **The search page** at `/`. It shows one card per result: title, authors, year, venue, citation count, and
+  DOI / open-access links. Each title links to the work's OpenAlex page. Details are in step 4.
+- **Endpoints.** `/api/search?query=&k=` returns `{query, k, corpus, took_ms, hits: [{id, score}]}`. `k` must be
+  1 to 100, and the query 1 to 512 characters. Anything else returns 422.
+- **Background loading.** The server starts at once and loads the index on a worker thread. `/api/healthz`
+  answers during the load. `/api/readyz` and `/api/search` return 503 until the load finishes.
 - **Failed load.** Both health checks return 503, because only a restart can fix it.
 - **Searches off the event loop.** Each search runs on a worker thread, at most 4 at a time. A slow search does not
-  block other requests, including `/healthz`.
+  block other requests, including `/api/healthz`.
 - **Thread safety.**
   - In C++, the query path is `const`, so the compiler rejects any write to shared state.
   - ThreadSanitizer finds no data race when 8 threads share one engine.
   - The tokenizer gives each thread its own DuckDB cursor.
-- **Tests.** `uv run pytest` runs 85 Python tests in about 17 s, including the API. `ctest` runs 198 C++ tests.
-- **Run it locally.** From `python/`, run `fastapi dev src/startorch/api/api.py`. The profile is the `PROFILE`
-  constant in `api.py`, `msmarco` by default.
+- **Tests.**
+  - `uv run pytest` runs 94 Python tests in about 17 s, including the API and the served page.
+  - `node --test frontend/tests/` runs the page's formatting tests.
+  - `ctest` runs 198 C++ tests.
+  - Browser behavior is covered by the manual checklist in `frontend/TESTING.md`.
+- **Run it locally.** From `python/`, run `STARTORCH_PROFILE=full-en fastapi dev src/startorch/api/api.py`, then
+  open `http://127.0.0.1:8000/`. Without the variable, the profile is `msmarco`, whose results have no titles.
 
 ### Measurements
 
@@ -55,19 +62,26 @@ Last updated 2026-09-21. The current status is in the next section. Check curren
 | Load time and memory, msmarco | 0.4 s, 0.3 GiB |
 | Parallel search speedup | 1.7× on 2 threads, 2.7× on 4, 3.6× on 8 |
 | Longest event-loop pause during a load | 0.006 s (0.41 s before the GIL was released) |
+| Search time, full-en, the page's example queries | 30 to 50 ms for 20 results |
+| Search time, full-en, common-word queries | up to about 600 ms for 10 results |
+| Time from opening a search link to results, during a full-en load | 17 s; the page waits and then searches by itself |
 
 So the target is one instance with 16 GiB of RAM and about 70 GB of disk.
 
+**Result quality on full-en.** Many queries return mostly OpenAlex expansion records: datasets, software, and
+"other" items with no citations. Their title-only text is short, and BM25 favors short documents. For example,
+"graph neural networks" and "Riemann hypothesis" have no scholarly work in their top 5. The page's example queries
+were chosen from those whose top 10 are 9 or 10 scholarly works. PageRank is expected to push these records down.
+
 ### Next
 
-1. Write the Dockerfile and `compose.yaml` (steps 4 and 6). Test them locally with the msmarco profile.
-2. Make the profile an environment variable instead of a code constant, so one image can serve any index.
-3. Add a request timeout and the result cache (steps 1 and 7).
-4. Upload the full-en index to S3, and run it on EC2 (steps 5 and 6).
-5. Set up the uptime monitor and the budget alarm (step 8).
+1. Write the Dockerfile, `compose.yaml` and Caddyfile (steps 5 and 7). Test them locally with the msmarco profile.
+2. Add a request timeout and the result cache (steps 1 and 8).
+3. Upload the full-en index to S3, and run it on EC2 (steps 6 and 7).
+4. Buy a domain, point it at the Elastic IP, and switch Caddy to HTTPS (step 7).
+5. Set up the uptime monitor and the budget alarm (step 9).
 
-**Still open:** whether xpac and deleted works stay in the served index, and whether the instance runs all the
-time or only for demos.
+**Still open:** whether the instance runs all the time, or only for demos.
 
 ---
 
@@ -79,14 +93,15 @@ time or only for demos.
 | Validation, caps | **FastAPI's `Query` constraints** | comes with FastAPI, no extra package |
 | Concurrency limit | **anyio's `CapacityLimiter`**, 4 searches at a time | already installed with FastAPI; in use |
 | Result cache | **`functools.lru_cache`** | stdlib; not added yet |
+| Front end | **One static page**: HTML, plain JavaScript, **Pico.css** from a CDN | no build step, no framework, no `node_modules` |
 | Build + run | **Docker** multi-stage build, **Docker Compose** | compiles the C++ in a builder stage, ships a slim runtime; the index stays outside the image |
-| TLS + reverse proxy | **Caddy**, as the second Compose service | automatic Let's Encrypt certificates, ~4 lines of config |
+| TLS, page, reverse proxy | **Caddy**, as the second Compose service | serves the page, proxies `/api` to FastAPI, and gets Let's Encrypt certificates itself |
 | Process supervision | **systemd** unit running Compose | already on the machine |
 | Index storage | **S3**, copied to an EBS volume with the **AWS CLI** | CLI preinstalled on Amazon Linux |
 | Machine | **one EC2 instance**, 16 GiB RAM | plus an AMI snapshot once it works |
 | Shell access | **SSM Session Manager** | agent preinstalled, no SSH keys or port 22 |
 | Logs | **journald** (`journalctl -u startorch`) | already there |
-| Uptime check | a **free external monitor** hitting `/healthz` | UptimeRobot, Better Stack, or similar |
+| Uptime check | a **free external monitor** hitting `/api/healthz` | UptimeRobot, Better Stack, or similar |
 | Cost safety | **AWS Budgets** alarm | free, set it first |
 | Load test | **the existing `bmw_performance.py`** | already written |
 
@@ -116,15 +131,18 @@ and no horizontal scale. All acceptable for a demo, none acceptable for a produc
 
 ## Step 1. Wrap `Searcher` in FastAPI — done
 
-**Goal.** `GET /search?query=...&k=10` returns JSON, with the index loaded once.
+**Goal.** `GET /api/search?query=...&k=10` returns JSON, with the index loaded once.
 
 **Built** (`python/src/startorch/api/`):
 - The lifespan handler starts the index load as a background task. The `Searcher` lives in the module's
   `resources` dict. It is never built per request.
 - `k` must be 1 to 100 (default 10), and the query 1 to 512 characters. FastAPI's `Query` constraints return 422
   for anything else.
-- Three routes: `/search`, `/healthz` (process alive), `/readyz` (index loaded).
-- Responses are Pydantic models in `schemas.py`. They include the C++ search time as `took_ms`.
+- Three routes under `/api`: `/api/search`, `/api/healthz` (process alive), `/api/readyz` (index loaded). The
+  prefix leaves `/` free for the page.
+- Responses are Pydantic models in `schemas.py`. They include the C++ search time as `took_ms`, and `corpus`, so
+  the page knows whether ids have OpenAlex records.
+- The profile to serve comes from the `STARTORCH_PROFILE` environment variable, so one image can serve any index.
 
 **Not done yet.** Cache results with `@lru_cache(maxsize=1024)` on `(query, k)`. Real traffic repeats.
 
@@ -159,18 +177,59 @@ The index holds ids and scores only. Rather than building a second database of t
 the caller resolves them. OpenAlex ids get their `W` prefix back, so they can go straight to the OpenAlex API;
 MS MARCO ids stay bare.
 
-To resolve them:
-
-- `https://api.openalex.org/works?filter=ids.openalex:W1|W2|...` fetches up to 50 works in one request.
-- Do it in the browser, or server-side in one call per search.
+The page resolves them in the browser, with one request per results page:
+`https://api.openalex.org/works?filter=ids.openalex:W1|W2|...&include_xpac=true`. Step 4 has the details.
 
 Two consequences to accept: results depend on OpenAlex being up, and ids deleted since the June 2026 snapshot
-resolve to nothing (see `CLAUDE.md` — that already affects about a sixth of sampled W7 ids). Filtering those
-out of the index is a separate, open decision.
+resolve to nothing (see `CLAUDE.md` — that already affects about a sixth of sampled W7 ids). The page shows those
+as muted fallback cards. Removing them from the ranking is left to PageRank.
 
-**Research.** OpenAlex `ids.openalex` filter, the polite pool and its rate limits, batching lookups.
+**Research.** OpenAlex `ids.openalex` filter, OpenAlex rate limits and API keys, batching lookups.
 
-## Step 4. Build the image with Docker
+## Step 4. Front end — done
+
+**Goal.** A simple, presentable search page, without a framework or a build step.
+
+**Built** (`frontend/`):
+- `index.html`: a header with links to GitHub and the technical report, the search box, four example queries, the
+  results list, and a short "How it works" section. Styled with Pico.css from a CDN.
+- `format.js`: pure formatting logic (titles, authors, the meta line, the OpenAlex request). No DOM, so Node tests
+  it: `node --test frontend/tests/`.
+- `app.js`: the page logic. Everything from the network goes in with `textContent`, never `innerHTML`.
+- `style.css`: small additions on top of Pico.
+
+**How a search works.**
+1. The page calls `/api/search` and shows one card per hit at once, in rank order.
+2. It makes one request to the OpenAlex API for all the cards, with `include_xpac=true`. Without that flag,
+   OpenAlex leaves out its expansion records, which are about 42% of the English corpus.
+3. It fills each card: title, authors, year, venue, citation count, DOI and open-access links. OpenAlex returns
+   records in its own order, so they are matched back to the ranked list by id.
+
+**Rules.**
+- **No abstracts.** Each card shows the title as its main text.
+- **`[Untitled]`** replaces a missing, empty, blank, or markup-only title.
+- **Deleted records** get a muted card: "No longer in OpenAlex: deleted or merged since the June 2026 snapshot".
+- **If OpenAlex is unreachable,** the cards keep their rank and id, link to OpenAlex, and explain the problem.
+
+**Page states.**
+- While the index loads, the page says so, polls `/api/readyz`, and runs the search when ready.
+- If the backend is unreachable, it says the demo may be offline.
+- Invalid queries and queries with no results get a clear message.
+- The query is in the URL (`/?q=...`), so a search can be shared. Back and forward work.
+- Starting a new search cancels the previous one, so old results never replace newer ones.
+
+**OpenAlex limits.** Without a key, OpenAlex allows 1,000 calls per day. Since the browser makes the calls, each
+visitor has their own allowance, and a search costs one call. A free API key raises the limit to $1 of usage per
+day. But a key is tied to your account's budget, so it must never go in browser code; using one would mean
+moving the lookups to the server.
+
+**Serving.** In development, FastAPI serves `frontend/` at `/`. In production, Caddy serves it and sends only
+`/api/*` to FastAPI (step 7). The page calls `/api/...` on its own origin, so it needs no CORS setup and no change
+between the two.
+
+**Research.** Pico.css, `fetch` and `AbortController`, `history.pushState`, `URLSearchParams`, `node:test`.
+
+## Step 5. Build the image with Docker
 
 **Goal.** One image that runs the same on your machine and on the instance.
 
@@ -186,7 +245,10 @@ copying source, so editing a `.py` file doesn't reinstall every package. Put the
 changes less often than Python code but more often than dependencies.
 
 **The index never goes in the image.** It is 56 GB, it changes on a different schedule, and an image is not a
-data store. It lives on the host and is bind-mounted read-only (step 5).
+data store. It lives on the host and is bind-mounted read-only (steps 6 and 7).
+
+**The page does not go in this image either.** Caddy serves `frontend/` from its own container (step 7). Without
+the folder, FastAPI simply skips its development-only page mount.
 
 **Two things that bite here specifically.**
 - **Architecture.** Build for the architecture you deploy on. If you develop on x86_64 and deploy on Graviton,
@@ -198,7 +260,7 @@ data store. It lives on the host and is bind-mounted read-only (step 5).
 **Research.** Docker multi-stage builds, layer caching and COPY order, `.dockerignore` (exclude `cpp/build/`,
 `.venv/`, `python/.tmp/`), BuildKit cache mounts, `docker buildx --platform`, slim vs distroless base images.
 
-## Step 5. Index to S3, then to the instance
+## Step 6. Index to S3, then to the instance
 
 - Upload the serving files (not `token_stream/`, not `partial/`) to a versioned prefix:
   `aws s3 sync <dir> s3://<bucket>/indexes/full-en/2026-09-19/`.
@@ -211,13 +273,64 @@ fault would become a network round trip.
 
 **Research.** `aws s3 sync`, S3 versioning, EBS gp3 throughput, EBS snapshots, VPC gateway endpoint for S3.
 
-## Step 6. Run it with Compose, behind Caddy
+## Step 7. Run it with Compose, behind Caddy
 
 **Two services in one `compose.yaml`.**
-- `startorch`: your image, running Uvicorn. No published ports — only Caddy reaches it, by service name on the
-  Compose network. Bind-mount the index read-only: `/data/index:/index:ro`.
-- `caddy`: the official image, publishing 80 and 443, proxying to `startorch:8000`. Give it a named volume for
-  `/data`, or it re-requests certificates on every restart and hits Let's Encrypt's rate limits.
+- `startorch`: your image, running Uvicorn, with `STARTORCH_PROFILE=full-en`. No published ports: only Caddy
+  reaches it, by service name on the Compose network. Bind-mount the index read-only: `/data/index:/index:ro`.
+- `caddy`: the official image, publishing 80 and 443. It serves the page and proxies `/api/*` to
+  `startorch:8000`. Mount `frontend/` read-only at `/srv/frontend`, and the Caddyfile at `/etc/caddy/Caddyfile`.
+  Give it a named volume for `/data`, or it re-requests certificates on every restart and hits Let's Encrypt's
+  rate limits.
+
+**The Caddyfile, before you have a domain.** Caddy serves plain HTTP on port 80, at the instance's Elastic IP,
+for example `http://203.0.113.10/`:
+
+```
+:80 {
+    handle /api/* {
+        reverse_proxy startorch:8000
+    }
+    handle {
+        root * /srv/frontend
+        file_server
+    }
+}
+```
+
+This is enough to test the whole site on EC2. But there is no HTTPS: a normal Let's Encrypt certificate needs a
+domain name. Browsers mark the page "Not secure", so do not send this address to recruiters.
+
+**The Caddyfile, once you have a domain.**
+1. Buy a domain from any registrar (Route 53, Cloudflare, Porkbun, and others all work).
+2. Add a DNS A record: `search.yourdomain.com` → the Elastic IP.
+3. In the Caddyfile, replace `:80` with the name. Keep the two `handle` blocks the same:
+
+   ```
+   search.yourdomain.com {
+       handle /api/* {
+           reverse_proxy startorch:8000
+       }
+       handle {
+           root * /srv/frontend
+           file_server
+       }
+   }
+   ```
+4. Reload Caddy: `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
+
+Caddy then gets a Let's Encrypt certificate by itself, renews it, and redirects HTTP to HTTPS. Keep ports 80
+and 443 open: port 80 answers the certificate check and serves the redirect.
+
+Nothing else changes. The page calls `/api/...` on its own origin, so neither the page nor the API needs editing.
+
+**Use an Elastic IP.** A normal EC2 public IP changes every time the instance stops. An Elastic IP stays the same,
+so the DNS record never needs updating, even if the instance only runs for demos. AWS charges a small hourly fee
+for every public IPv4 address, in use or not; check current pricing.
+
+**Optional: HTTPS before buying a domain.** A wildcard DNS service such as sslip.io maps a name like
+`203-0-113-10.sslip.io` to that IP, and Caddy can get a real certificate for it. This is useful for testing
+HTTPS, but these names share Let's Encrypt's rate limits with every other user, and a real domain looks better.
 
 **Memory limits are where containers get interesting for this service.** Set `mem_limit` above the 8.7 GiB load
 peak, with headroom — 12 GiB on a 16 GiB machine is a reasonable start. Two things to understand before
@@ -234,14 +347,13 @@ Swapped heap hurts far more than evicted posting pages.
 **Supervision.** A small systemd unit runs `docker compose up` on boot, so the stack survives a reboot without
 Docker's restart policy being the only thing holding it together.
 
-**Networking.** Point your domain's A record at the instance's Elastic IP. Security group: 80 and 443 open,
-nothing else. Shell access through SSM Session Manager.
+**Networking.** Security group: 80 and 443 open, nothing else. Shell access through SSM Session Manager.
 
 **Research.** Compose service networking and DNS by service name, bind mounts vs named volumes, `mem_limit`
 and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in `docker inspect`, Caddy's
-`/data` volume, systemd units that wrap Compose.
+`/data` volume, Caddyfile `handle` and `file_server`, Elastic IPs, DNS A records, systemd units that wrap Compose.
 
-## Step 7. Keep it from falling over — partly done
+## Step 8. Keep it from falling over — partly done
 
 - **Done:** the input limits from step 1 (`k`, query length) and the search limit from step 2.
 - **Not done:** a request timeout, so a pathological query cannot hold a slot forever.
@@ -250,15 +362,16 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
 
 **Research.** Cloudflare proxied DNS, rate limiting rules, `Cache-Control`, request timeouts in Uvicorn.
 
-## Step 8. Minimal operations
+## Step 9. Minimal operations
 
 - **Logs:** `journalctl -u startorch -f`. Uvicorn's access log is enough to see traffic and errors.
-- **Uptime:** a free external monitor pinging `/healthz` every few minutes, alerting by email.
+- **Uptime:** a free external monitor pinging `/api/healthz` every few minutes, alerting by email.
 - **Cost:** an AWS Budgets alarm, set before the first full-size instance runs overnight. A 16 GiB instance
   running 24/7 is the dominant cost; stopping it when not in use is the simplest saving, and an Elastic IP plus
   the EBS volume keep the setup intact while stopped.
 - **Load test:** point the existing `bmw_performance.py` at the deployed URL's underlying profile, or use
-  `hey`/`ab` against `/search`, before showing it to anyone.
+  `hey`/`ab` against `/api/search`, before showing it to anyone. Then run the checklist in `frontend/TESTING.md`
+  against the public address.
 - **Deploy:** `git pull`, `docker compose build`, `docker compose up -d`. Compose recreates only what changed.
   About a minute of downtime while the index reloads.
 - **Container logs:** `docker compose logs -f startorch`, which journald still captures underneath.
@@ -279,5 +392,8 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
 
 1. **Decided:** release the GIL and search in parallel (step 2).
 2. **Decided:** resolve ids on the client, with no metadata store (step 3).
-3. **Open:** whether xpac and deleted works stay in the served index (see `CLAUDE.md`).
-4. **Open:** whether the instance runs all the time, or only when you demo it.
+3. **Decided:** a static page with no framework, served by Caddy on the same origin as the API. Cards show titles,
+   with no abstracts (steps 4 and 7).
+4. **Decided:** xpac and deleted works stay in the index for now. PageRank should push them down, and the page
+   shows fallback cards for deleted ones (steps 3 and 4).
+5. **Open:** whether the instance runs all the time, or only when you demo it.

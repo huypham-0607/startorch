@@ -61,29 +61,29 @@ def poll(client, path: str, status: int, timeout: float = 10.0):
 
 def test_before_startup_only_healthz_succeeds():
     c = TestClient(api.app)   # no `with`: the lifespan never runs
-    assert c.get("/healthz").status_code == 200
-    assert c.get("/readyz").status_code == 503
-    assert c.get("/search", params={"query": "x"}).status_code == 503
+    assert c.get("/api/healthz").status_code == 200
+    assert c.get("/api/readyz").status_code == 503
+    assert c.get("/api/search", params={"query": "x"}).status_code == 503
 
 
 def test_serves_healthz_while_the_index_loads(monkeypatch):
     monkeypatch.setattr(api, "Searcher", fake_searcher(load_seconds=1.0))
     with TestClient(api.app) as c:
-        assert c.get("/healthz").status_code == 200
-        r = c.get("/readyz")
+        assert c.get("/api/healthz").status_code == 200
+        r = c.get("/api/readyz")
         assert r.status_code == 503 and "loading" in r.json()["detail"]
-        assert c.get("/search", params={"query": "x"}).status_code == 503
+        assert c.get("/api/search", params={"query": "x"}).status_code == 503
 
-        poll(c, "/readyz", 200)
-        body = c.get("/search", params={"query": "x"}).json()
+        poll(c, "/api/readyz", 200)
+        body = c.get("/api/search", params={"query": "x"}).json()
         assert body["hits"] == [{"id": "W2626778328", "score": 1.5}], "OpenAlex ids get their W prefix"
 
 
 def test_failed_load_fails_both_health_checks(monkeypatch):
     monkeypatch.setattr(api, "PROFILE", "no-such-profile")
     with TestClient(api.app) as c:
-        poll(c, "/healthz", 503)
-        r = c.get("/readyz")
+        poll(c, "/api/healthz", 503)
+        r = c.get("/api/readyz")
         assert r.status_code == 503 and "failed to load" in r.json()["detail"]
 
 
@@ -91,7 +91,7 @@ def test_shutdown_closes_the_searcher(monkeypatch):
     fake = fake_searcher()
     monkeypatch.setattr(api, "Searcher", fake)
     with TestClient(api.app) as c:
-        poll(c, "/readyz", 200)
+        poll(c, "/api/readyz", 200)
     assert fake.instances[0].closed
     assert api.resources == {}
 
@@ -99,9 +99,9 @@ def test_shutdown_closes_the_searcher(monkeypatch):
 @pytest.mark.index
 def test_shutdown_releases_the_real_index():
     with TestClient(api.app) as c:
-        poll(c, "/readyz", 200, timeout=60)
+        poll(c, "/api/readyz", 200, timeout=60)
         searcher = api.resources["searcher"]
-        c.get("/search", params={"query": "ocean"})   # creates a tokenizer cursor on a worker thread
+        c.get("/api/search", params={"query": "ocean"})   # creates a tokenizer cursor on a worker thread
         connections = [searcher.tokenizer.con, *searcher.tokenizer._cursors]   # close() empties the list
     assert api.resources == {}
     assert len(connections) > 1, "the search should have created a worker-thread cursor"
@@ -124,7 +124,7 @@ async def _with_app(fn):
         transport = httpx.ASGITransport(app=api.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
             with anyio.fail_after(10):
-                while (await client.get("/readyz")).status_code != 200:
+                while (await client.get("/api/readyz")).status_code != 200:
                     await anyio.sleep(0.02)
             return await fn(client)
 
@@ -135,10 +135,10 @@ async def test_slow_search_does_not_block_healthz(monkeypatch):
 
     async def check(client):
         async with anyio.create_task_group() as tg:
-            tg.start_soon(lambda: client.get("/search", params={"query": "x"}))
+            tg.start_soon(lambda: client.get("/api/search", params={"query": "x"}))
             await anyio.sleep(0.05)                    # the search is now running
             start = time.perf_counter()
-            assert (await client.get("/healthz")).status_code == 200
+            assert (await client.get("/api/healthz")).status_code == 200
             return time.perf_counter() - start
 
     healthz_seconds = await _with_app(check)
@@ -154,7 +154,7 @@ async def test_concurrent_searches_are_capped(monkeypatch):
         start = time.perf_counter()
         async with anyio.create_task_group() as tg:
             for _ in range(8):
-                tg.start_soon(lambda: client.get("/search", params={"query": "x"}))
+                tg.start_soon(lambda: client.get("/api/search", params={"query": "x"}))
         return time.perf_counter() - start
 
     elapsed = await _with_app(eight_at_once)
