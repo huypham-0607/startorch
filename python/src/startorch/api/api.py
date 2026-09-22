@@ -1,45 +1,79 @@
-"""The HTTP API: search over one profile's index, loaded once at startup.
+"""The HTTP API: search over one profile's index, loaded in the background at startup.
 
-Every endpoint is `async def`, so every request runs on the event loop's one
-thread. That keeps searches from overlapping, which matters because the
-tokenizer's DuckDB connection is not thread-safe. The cost is that a slow search
-delays every request queued behind it, /healthz included.
+The server accepts requests as soon as it starts. The index loads on a worker
+thread, so /healthz answers throughout, and /readyz and /search return 503 until
+the load finishes. Searches also run on worker threads, at most
+MAX_CONCURRENT_SEARCHES at a time, so a slow search never blocks the event loop.
+Both are possible because the C++ engine releases the GIL while it loads and
+searches, and both it and the tokenizer are thread-safe.
 
 Typical usage example, from python/:
 
     fastapi dev src/startorch/api/api.py
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from typing import Annotated
 
+import anyio
 from fastapi import FastAPI, HTTPException, Query
 
 from startorch.api.schemas import Hit, SearchResponse
 from startorch.lexical.search import Searcher, SearchResult
+from startorch.utils.logger import get_logger
 from startorch.utils.paths import profile
+
+logger = get_logger(__name__)
 
 PROFILE = "msmarco"
 MAX_K = 100
 MAX_QUERY_LENGTH = 512
+# Searches are CPU-bound, so more than about one per core only adds queueing.
+MAX_CONCURRENT_SEARCHES = 4
 
 resources = {}
 
 
+async def _load_searcher() -> Searcher | None:
+    """Loads the index on a worker thread and publishes it in resources.
+
+    A failure is recorded in resources["load_error"] rather than raised, so the
+    health endpoints can report it.
+
+    Returns:
+        The loaded Searcher, or None if the load failed.
+    """
+    try:
+        searcher = await anyio.to_thread.run_sync(Searcher, profile(PROFILE))
+    except Exception as e:
+        logger.exception(f"Failed to load the index for profile {PROFILE}.")
+        resources["load_error"] = e
+        return None
+    resources["searcher"] = searcher
+    logger.info(f"Index for profile {PROFILE} is loaded; serving searches.")
+    return searcher
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Loads the index before the server accepts requests, and releases it on shutdown.
+    """Starts loading the index in the background, and releases it on shutdown.
 
-    Loading happens before `yield`, so Uvicorn starts serving only once the
-    index is ready. Loading on a background thread would not help yet: the C++
-    constructor holds the GIL, so the event loop would freeze for the whole load.
+    Shutdown waits for a load still in progress, since a C++ load cannot be
+    interrupted, then closes exactly the searcher this lifespan loaded.
 
     Args:
         app: The application being started.
     """
-    resources["searcher"] = Searcher(profile(PROFILE))
+    resources["search_limiter"] = anyio.CapacityLimiter(MAX_CONCURRENT_SEARCHES)
+    # This local reference also keeps the task from being garbage-collected
+    # mid-load: asyncio itself holds tasks only weakly.
+    loading = asyncio.create_task(_load_searcher())
     yield
-    resources.pop("searcher").close()
+    searcher = await loading
+    if searcher is not None:
+        searcher.close()
+    resources.clear()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -49,12 +83,14 @@ def _searcher() -> Searcher:
     """Returns the loaded Searcher.
 
     Raises:
-        HTTPException: 503 if the index is not loaded yet.
+        HTTPException: 503 if the index is still loading, or failed to load.
     """
     searcher = resources.get("searcher")
-    if searcher is None:
-        raise HTTPException(status_code=503, detail="Index is still loading.")
-    return searcher
+    if searcher is not None:
+        return searcher
+    if "load_error" in resources:
+        raise HTTPException(status_code=503, detail=f"Index failed to load: {resources['load_error']}")
+    raise HTTPException(status_code=503, detail="Index is still loading.")
 
 
 def to_response(query: str, k: int, result: SearchResult, kind: str) -> SearchResponse:
@@ -87,10 +123,16 @@ async def root():
 
 @app.get("/healthz")
 async def healthz():
-    """Liveness check: the process is running and the event loop responds.
+    """Liveness check: the process is running and can still become ready.
 
-    Does no work, and never touches the index.
+    Answers while the index loads, and never touches the index. Fails only if the
+    load failed, which only a restart can fix.
+
+    Raises:
+        HTTPException: 503 if the index failed to load.
     """
+    if "load_error" in resources:
+        raise HTTPException(status_code=503, detail="Index failed to load; restart required.")
     return {"status": "ok"}
 
 
@@ -102,7 +144,7 @@ async def readyz():
         The profile being served.
 
     Raises:
-        HTTPException: 503 if the index is not loaded yet.
+        HTTPException: 503 if the index is still loading, or failed to load.
     """
     _searcher()
     return {"status": "ready", "profile": PROFILE}
@@ -113,7 +155,7 @@ async def search(
     query: Annotated[str, Query(min_length=1, max_length=MAX_QUERY_LENGTH)],
     k: Annotated[int, Query(ge=1, le=MAX_K)] = 10,
 ) -> SearchResponse:
-    """Runs a BM25 top-k search over the loaded index.
+    """Runs a BM25 top-k search over the loaded index, on a worker thread.
 
     A query of only stopwords or unknown words returns an empty hit list.
 
@@ -125,8 +167,8 @@ async def search(
         Up to k hits, best first.
 
     Raises:
-        HTTPException: 503 if the index is not loaded yet.
+        HTTPException: 503 if the index is still loading, or failed to load.
     """
     searcher = _searcher()
-    result = searcher.search(query, k)
+    result = await anyio.to_thread.run_sync(searcher.search, query, k, limiter=resources["search_limiter"])
     return to_response(query, k, result, searcher.profile.kind)

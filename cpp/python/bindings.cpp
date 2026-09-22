@@ -47,20 +47,28 @@ PYBIND11_MODULE(startorch_cpp, m) {
         "raises ValueError."
     );
 
+    // The constructor and both queries release the GIL while they run. Safe:
+    // pybind11 converts the arguments to C++ before releasing it and converts
+    // the result back after re-acquiring it, so no Python object is touched in
+    // between. query()/query_exhaustive() are const and thread-safe (see
+    // QueryEngine), so Python threads may call them on one engine at once.
     py::class_<QueryEngine>(
         m, "QueryEngine",
         "An opened index. Constructing it does the whole index load once; "
-        "keep one engine and call query()/query_exhaustive() repeatedly."
+        "keep one engine and call query()/query_exhaustive() repeatedly. "
+        "Thread-safe; the GIL is released while loading and searching."
     )
         .def(
             py::init<const fs::path&>(),
             py::arg("meta_path"),
+            py::call_guard<py::gil_scoped_release>(),
             "Load the index whose metadata.bin is at meta_path."
         )
         .def(
             "query",
             &QueryEngine::query,
             py::arg("terms"), py::arg("k"),
+            py::call_guard<py::gil_scoped_release>(),
             "Run a Block-Max WAND top-k BM25 query. Returns (results, elapsed): "
             "results is a list of (score, doc_id) pairs best-first, elapsed is "
             "this query's search time (index load not included)."
@@ -69,6 +77,7 @@ PYBIND11_MODULE(startorch_cpp, m) {
             "query_exhaustive",
             &QueryEngine::query_exhaustive,
             py::arg("terms"), py::arg("k"),
+            py::call_guard<py::gil_scoped_release>(),
             "Like query, but scores every candidate document with no pruning. "
             "Same return shape. Ground truth for query: results must match "
             "exactly, only elapsed should differ."

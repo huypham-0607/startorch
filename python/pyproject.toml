@@ -29,3 +29,14 @@ build-backend = "uv_build"
 # For Pylance to work properly
 [tool.pyright]
 extraPaths = ["python/src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "index: needs the built msmarco index under /data (read-only); skipped when it is missing",
+]

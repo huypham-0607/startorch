@@ -20,13 +20,16 @@
 
 const unsigned long long MAX_DOC_ID = std::numeric_limits<unsigned long long>::max();
 
+// A cursor over one term's posting list. All of its state is its own; the
+// index it reads (term metadata, posting files) is only ever read through
+// const pointers, so any number of cursors may share one index across threads.
 class PostingPointer {
 public:
     PostingPointer(
         const std::string& _term,
         const int _block_size,
-        std::unordered_map<std::string, TermMeta> &term_meta_mapping,
-        std::unordered_map<unsigned int, SafeFileMmap> &file_index_mapping
+        const std::unordered_map<std::string, TermMeta> &term_meta_mapping,
+        const std::unordered_map<unsigned int, SafeFileMmap> &file_index_mapping
     );
 
     int get_cur_block_size(const int block_id) const;
@@ -45,8 +48,8 @@ public:
     
 private:
     std::string term;
-    TermMeta* term_meta;
-    SafeFileMmap* posting_file;
+    const TermMeta* term_meta;
+    const SafeFileMmap* posting_file;
     int block_size;
     int cur_block_id;
     int deep_block_id;
@@ -67,7 +70,7 @@ bool check_block_max(std::vector<PostingPointer>& postings, const int pivot, con
 float evaluate_prefix(
     std::vector<PostingPointer>& postings,
     const int pivot,
-    std::vector<unsigned int>& doc_len_list,
+    const std::vector<unsigned int>& doc_len_list,
     const float avgdl,
     const float k1,
     const float b
@@ -135,6 +138,12 @@ using QueryElapsed = std::chrono::duration<double, std::milli>;
  * metadata via load_index, doc lengths, posting-file mmaps). Callers keep one
  * engine and call query()/query_exhaustive() repeatedly; each call returns its
  * results and the time spent searching, which excludes the index load.
+ *
+ * Thread safety: once constructed, the engine is immutable. query() and
+ * query_exhaustive() are const and build all per-query state (cursors, the
+ * top-k heap) locally, so any number of threads may call them on one engine at
+ * the same time. The const qualifiers make the compiler reject any write to
+ * shared state on that path; QueryEngineConcurrencyTest checks it under TSan.
  */
 class QueryEngine {
 public:
@@ -144,14 +153,14 @@ public:
     std::pair<QueryResult, QueryElapsed> query(
         const std::vector<std::string>& raw_terms,
         const int k
-    );
+    ) const;
 
     // Scores every candidate with no pruning. Ground truth for query(): the
     // results must match exactly, only the time differs.
     std::pair<QueryResult, QueryElapsed> query_exhaustive(
         const std::vector<std::string>& raw_terms,
         const int k
-    );
+    ) const;
 
 private:
     using TopK = std::priority_queue<
@@ -160,10 +169,10 @@ private:
         std::greater<std::pair<float, unsigned long long>>
     >;
 
-    QueryResult search(const std::vector<std::string>& raw_terms, const int k);
-    QueryResult search_exhaustive(const std::vector<std::string>& raw_terms, const int k);
+    QueryResult search(const std::vector<std::string>& raw_terms, const int k) const;
+    QueryResult search_exhaustive(const std::vector<std::string>& raw_terms, const int k) const;
 
-    std::vector<PostingPointer> open_postings(const std::vector<std::string>& raw_terms);
+    std::vector<PostingPointer> open_postings(const std::vector<std::string>& raw_terms) const;
     static TopK make_top_k(const int k);
     static QueryResult drain_top_k(TopK& top_k);
 

@@ -64,7 +64,12 @@ def build_index(
     ...
 
 class QueryEngine:
-    """An opened index: loaded once, then queried repeatedly."""
+    """An opened index: loaded once, then queried repeatedly.
+
+    Thread-safe: any number of threads may call query() and query_exhaustive()
+    on one engine at once. The constructor and both queries release the GIL
+    while they run, so other Python threads keep running meanwhile.
+    """
     def __init__(self, meta_path: _Path) -> None:
         """Loads the index whose metadata.bin is at meta_path.
 

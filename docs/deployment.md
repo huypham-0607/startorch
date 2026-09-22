@@ -7,7 +7,67 @@ Two rules shaped it: **write as little as possible**, and **depend on as little 
 against each other, so where a managed service costs real money or real setup time, this picks the boring
 option that ships.
 
-Written against the project state on 2026-09-20. Check current docs before pinning versions.
+Last updated 2026-09-21. The current status is in the next section. Check current docs before pinning versions.
+
+---
+
+## Status
+
+**The HTTP API works and is tested locally. Nothing is deployed yet.**
+
+| Step | Status | Notes |
+|---|---|---|
+| 1. FastAPI wrapper | Done | `/search`, `/healthz`, `/readyz`. No result cache yet. |
+| 2. Concurrency | Done | The GIL is released. The engine and tokenizer are thread-safe. 4 searches run at a time. |
+| 3. Results without a metadata store | Done | The API returns OpenAlex ids with the `W` prefix. The client fetches titles. |
+| 4. Docker image | Not started | |
+| 5. Index in S3 | Not started | The full-en and msmarco indexes are built in the current format, ready to upload. |
+| 6. Compose + Caddy | Not started | |
+| 7. Protection | Partly done | Input limits and the search limit are in. No request timeout yet. |
+| 8. Operations | Not started | The health endpoints are ready for an uptime monitor. |
+
+### What works now
+
+- **Endpoints.** `/search?query=&k=` returns `{query, k, took_ms, hits: [{id, score}]}`. `k` must be 1 to 100, and
+  the query 1 to 512 characters. Anything else returns 422.
+- **Background loading.** The server starts at once and loads the index on a worker thread. `/healthz` answers
+  during the load. `/readyz` and `/search` return 503 until the load finishes.
+- **Failed load.** Both health checks return 503, because only a restart can fix it.
+- **Searches off the event loop.** Each search runs on a worker thread, at most 4 at a time. A slow search does not
+  block other requests, including `/healthz`.
+- **Thread safety.**
+  - In C++, the query path is `const`, so the compiler rejects any write to shared state.
+  - ThreadSanitizer finds no data race when 8 threads share one engine.
+  - The tokenizer gives each thread its own DuckDB cursor.
+- **Tests.** `uv run pytest` runs 85 Python tests in about 17 s, including the API. `ctest` runs 198 C++ tests.
+- **Run it locally.** From `python/`, run `fastapi dev src/startorch/api/api.py`. The profile is the `PROFILE`
+  constant in `api.py`, `msmarco` by default.
+
+### Measurements
+
+| Quantity | Value |
+|---|---|
+| Files needed to serve full-en | About 56 GB: posting files 47.7 GB, block metadata 2.25 GB, document lengths 1.73 GB, id lookup 4.15 GB |
+| Files not needed to serve | `token_stream/` (about 220 GB) and `posting/partial/`. They are build inputs only. |
+| Memory after load, full-en | 6.7 GiB |
+| Memory peak while loading, full-en | 8.7 GiB |
+| Load time, full-en | 14 s with a warm cache; longer from a cold disk |
+| Load time and memory, msmarco | 0.4 s, 0.3 GiB |
+| Parallel search speedup | 1.7× on 2 threads, 2.7× on 4, 3.6× on 8 |
+| Longest event-loop pause during a load | 0.006 s (0.41 s before the GIL was released) |
+
+So the target is one instance with 16 GiB of RAM and about 70 GB of disk.
+
+### Next
+
+1. Write the Dockerfile and `compose.yaml` (steps 4 and 6). Test them locally with the msmarco profile.
+2. Make the profile an environment variable instead of a code constant, so one image can serve any index.
+3. Add a request timeout and the result cache (steps 1 and 7).
+4. Upload the full-en index to S3, and run it on EC2 (steps 5 and 6).
+5. Set up the uptime monitor and the budget alarm (step 8).
+
+**Still open:** whether xpac and deleted works stay in the served index, and whether the instance runs all the
+time or only for demos.
 
 ---
 
@@ -17,8 +77,8 @@ Written against the project state on 2026-09-20. Check current docs before pinni
 |---|---|---|
 | HTTP API | **FastAPI** + **Uvicorn** | the only two Python packages added |
 | Validation, caps | **FastAPI's `Query` constraints** | comes with FastAPI, no extra package |
-| Concurrency limit | **`threading.Semaphore`** or anyio's limiter | stdlib, or already installed with FastAPI |
-| Result cache | **`functools.lru_cache`** | stdlib |
+| Concurrency limit | **anyio's `CapacityLimiter`**, 4 searches at a time | already installed with FastAPI; in use |
+| Result cache | **`functools.lru_cache`** | stdlib; not added yet |
 | Build + run | **Docker** multi-stage build, **Docker Compose** | compiles the C++ in a builder stage, ships a slim runtime; the index stays outside the image |
 | TLS + reverse proxy | **Caddy**, as the second Compose service | automatic Let's Encrypt certificates, ~4 lines of config |
 | Process supervision | **systemd** unit running Compose | already on the machine |
@@ -54,74 +114,52 @@ and no horizontal scale. All acceptable for a demo, none acceptable for a produc
 
 ---
 
-## Where the project stands today
+## Step 1. Wrap `Searcher` in FastAPI — done
 
-**What already works**
+**Goal.** `GET /search?query=...&k=10` returns JSON, with the index loaded once.
 
-- `Searcher` loads one index and answers queries in-process (`python/src/startorch/lexical/search.py`).
-- `QueryEngine` (C++, pybind11) does Block-Max WAND top-k BM25 and returns `(score, mapped_id)`.
-- `DocIdLookup` maps those back to OpenAlex ids.
-
-**What serving still needs**
-
-| Gap | Why it matters |
-|---|---|
-| No HTTP layer | Nothing accepts a request. `cli.py` prints to stdout. |
-| The bindings never release the GIL | Two requests cannot search at the same time. See step 2. |
-| No limits | `k`, query length and request rate are unbounded. |
-
-**Numbers that drive the sizing** (measured 2026-09-19, full-en)
-
-| Quantity | Value |
-|---|---|
-| Files needed to serve | `posting_*.bin` 47.7 GB, `block_meta.bin` 2.25 GB, `doc_len_list.bin` 1.73 GB, `doc_id_lookup.bin` 4.15 GB, metadata — **about 56 GB** |
-| Files *not* needed to serve | `token_stream/` (~220 GB), `posting/partial/` — build inputs only |
-| Heap after load | 6.7 GiB |
-| Heap peak during load | 8.7 GiB |
-| Load time | 14 s warm; longer from a cold disk |
-
-So: one instance, 16 GiB of RAM, about 70 GB of disk, and a slow start.
-
----
-
-## Step 1. Wrap `Searcher` in FastAPI
-
-**Goal.** `GET /search?q=...&k=10` returns JSON, index loaded once at startup.
-
-- Build the `Searcher` in FastAPI's **lifespan handler** and keep it on `app.state`. Never per request.
-- `k: int = Query(10, ge=1, le=100)` and a max query length. Validation and the 422 response are free.
+**Built** (`python/src/startorch/api/`):
+- The lifespan handler starts the index load as a background task. The `Searcher` lives in the module's
+  `resources` dict. It is never built per request.
+- `k` must be 1 to 100 (default 10), and the query 1 to 512 characters. FastAPI's `Query` constraints return 422
+  for anything else.
 - Three routes: `/search`, `/healthz` (process alive), `/readyz` (index loaded).
-- Return the search time the engine already reports, so latency is visible without a profiler.
-- Cache with `@lru_cache(maxsize=1024)` on `(query, k)`. Real traffic repeats.
+- Responses are Pydantic models in `schemas.py`. They include the C++ search time as `took_ms`.
 
-**Research.** FastAPI lifespan events, `app.state`, `Query` constraints, `functools.lru_cache`.
+**Not done yet.** Cache results with `@lru_cache(maxsize=1024)` on `(query, k)`. Real traffic repeats.
 
-## Step 2. Decide how concurrency works
+**Research.** FastAPI lifespan events, `Query` constraints, Pydantic response models, `functools.lru_cache`.
 
-The one thing no tool decides for you. `cpp/python/bindings.cpp` binds `QueryEngine::query` without
-`py::call_guard<py::gil_scoped_release>`, so the GIL is held for the whole search and one slow query blocks
-everything.
+## Step 2. Concurrency — done
 
-At this scale the cheapest correct answer is:
+The bindings used to hold the GIL for a whole search, so one slow query blocked everything. Now:
 
-1. **Add the GIL release** to the `query` bindings — one line of pybind11. First review whether
-   `QueryEngine::query` is safe on several threads: its methods are not `const` and they share the mapped
-   files and the doc-length vector.
-2. **Write the endpoint as `def`, not `async def`.** Starlette then runs it in its threadpool, so searches
-   overlap with no threading code.
-3. **Bound it with a `Semaphore`** of two or three, and return 503 when full. A queue that grows without limit
-   just turns into timeouts.
+1. **The GIL is released** in the bindings for the `QueryEngine` constructor, `query` and `query_exhaustive`.
+2. **The C++ query path is `const`,** so the compiler rejects writes to shared state. `term_meta_mapping[term]`
+   became a `find()` lookup, which is safe for concurrent reads.
+3. **The tokenizer gives each thread its own DuckDB cursor.** The shared DuckDB connection was the real failure:
+   322 of 400 threaded searches failed before this fix.
+4. **Searches run on worker threads** through `anyio.to_thread.run_sync`, with a `CapacityLimiter` of 4.
 
-If the review in (1) turns up shared mutable state, skip it: keep one search at a time behind the semaphore
-and accept the throughput. At this scale that is a real option, not a compromise.
+**One change from the plan.** The endpoints stay `async def` and hand each search to a worker thread, instead of
+becoming `def` endpoints. This gives searches their own limit, separate from Starlette's thread pool. Requests
+beyond the limit wait for a slot instead of getting a 503.
 
-**Research.** Python GIL, `gil_scoped_release`, thread safety vs `const`-correctness, Starlette threadpool,
-`asyncio`/`anyio` timeouts.
+**Checked by:**
+- ThreadSanitizer on `QueryEngineConcurrencyTest`. 8 threads share one engine, and no data race is found.
+- `test_search.py` and `test_tokenizer.py`. Threaded results match sequential ones, and another thread keeps
+  running during a load and during a long search.
 
-## Step 3. Results without a metadata store
+**Research.** Python GIL, `gil_scoped_release`, `const`-correctness, ThreadSanitizer, `anyio.to_thread`,
+`CapacityLimiter`.
 
-The index holds ids and scores only. Rather than building a second database of titles, return ids and let the
-caller resolve them:
+## Step 3. Results without a metadata store — done
+
+The index holds ids and scores only. Rather than building a second database of titles, the API returns ids and
+the caller resolves them. OpenAlex ids get their `W` prefix back, so they can go straight to the OpenAlex API;
+MS MARCO ids stay bare.
+
+To resolve them:
 
 - `https://api.openalex.org/works?filter=ids.openalex:W1|W2|...` fetches up to 50 works in one request.
 - Do it in the browser, or server-side in one call per search.
@@ -203,10 +241,10 @@ nothing else. Shell access through SSM Session Manager.
 and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in `docker inspect`, Caddy's
 `/data` volume, systemd units that wrap Compose.
 
-## Step 7. Keep it from falling over
+## Step 7. Keep it from falling over — partly done
 
-- Caps from step 1 (`k`, query length) plus the semaphore from step 2 do most of the work.
-- Add a request timeout so a pathological query cannot hold a slot forever.
+- **Done:** the input limits from step 1 (`k`, query length) and the search limit from step 2.
+- **Not done:** a request timeout, so a pathological query cannot hold a slot forever.
 - If abuse shows up, put **Cloudflare's free tier** in front: DNS, edge caching, and rate limiting at no cost,
   and it hides the origin address. That is the one dependency worth adding under pressure.
 
@@ -237,9 +275,9 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
   Bind-mount it read-only.
 - **Shipping `token_stream/` or `posting/partial/`.** Build inputs, several times the size of what serving needs.
 
-## Decisions to make before writing code
+## Decisions
 
-1. GIL release, or one search at a time behind a semaphore (step 2).
-2. Client-side id resolution, or a metadata store after all (step 3).
-3. Whether xpac and deleted works stay in the served index (see `CLAUDE.md`).
-4. Instance running 24/7, or started when you need to demo it.
+1. **Decided:** release the GIL and search in parallel (step 2).
+2. **Decided:** resolve ids on the client, with no metadata store (step 3).
+3. **Open:** whether xpac and deleted works stay in the served index (see `CLAUDE.md`).
+4. **Open:** whether the instance runs all the time, or only when you demo it.

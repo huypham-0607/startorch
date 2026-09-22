@@ -31,16 +31,19 @@ namespace fs = std::filesystem;
 PostingPointer::PostingPointer(
     const std::string& _term,
     const int _block_size,
-    std::unordered_map<std::string, TermMeta> &term_meta_mapping,
-    std::unordered_map<unsigned int, SafeFileMmap> &file_index_mapping
+    const std::unordered_map<std::string, TermMeta> &term_meta_mapping,
+    const std::unordered_map<unsigned int, SafeFileMmap> &file_index_mapping
 ) : term(_term) {
-    if (term_meta_mapping.find(term) == term_meta_mapping.end()) {
+    // find() is a read under the standard's container data-race rules;
+    // operator[] is not, even when the key exists, so it must not be used here.
+    const auto term_it = term_meta_mapping.find(term);
+    if (term_it == term_meta_mapping.end()) {
         throw std::runtime_error(std::format(
             "Unable to initialize PostingPointer: Term {} not found in term_meta_mapping",
             term
         ));
     }
-    term_meta = &(term_meta_mapping[term]);
+    term_meta = &term_it->second;
     auto file_it = file_index_mapping.find(term_meta->file_index);
     if (file_it == file_index_mapping.end()) {
         throw std::runtime_error(std::format(
@@ -253,7 +256,7 @@ bool check_block_max(std::vector<PostingPointer>& postings, const int pivot, con
 float evaluate_prefix(
     std::vector<PostingPointer>& postings,
     const int pivot,
-    std::vector<unsigned int>& doc_len_list,
+    const std::vector<unsigned int>& doc_len_list,
     const float avgdl,
     const float k1,
     const float b
@@ -360,7 +363,7 @@ QueryEngine::QueryEngine(const fs::path& meta_path) : logger(__FILE_NAME__, Logg
 std::pair<QueryResult, QueryElapsed> QueryEngine::query(
     const std::vector<std::string>& raw_terms,
     const int k
-) {
+) const {
     auto start = std::chrono::high_resolution_clock::now();
     QueryResult result = search(raw_terms, k);
     QueryElapsed elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -372,7 +375,7 @@ std::pair<QueryResult, QueryElapsed> QueryEngine::query(
 std::pair<QueryResult, QueryElapsed> QueryEngine::query_exhaustive(
     const std::vector<std::string>& raw_terms,
     const int k
-) {
+) const {
     auto start = std::chrono::high_resolution_clock::now();
     QueryResult result = search_exhaustive(raw_terms, k);
     QueryElapsed elapsed = std::chrono::high_resolution_clock::now() - start;
@@ -384,7 +387,7 @@ std::pair<QueryResult, QueryElapsed> QueryEngine::query_exhaustive(
 QueryResult QueryEngine::search(
     const std::vector<std::string>& raw_terms,
     const int k
-) {
+) const {
     std::vector<PostingPointer> postings = open_postings(raw_terms);
     TopK top_k = make_top_k(k);
 
@@ -440,7 +443,7 @@ QueryResult QueryEngine::search(
 QueryResult QueryEngine::search_exhaustive(
     const std::vector<std::string>& raw_terms,
     const int k
-) {
+) const {
     std::vector<PostingPointer> postings = open_postings(raw_terms);
     TopK top_k = make_top_k(k);
 
@@ -470,7 +473,7 @@ QueryResult QueryEngine::search_exhaustive(
 }
 
 // One cursor per query term; terms not in the index are dropped.
-std::vector<PostingPointer> QueryEngine::open_postings(const std::vector<std::string>& raw_terms) {
+std::vector<PostingPointer> QueryEngine::open_postings(const std::vector<std::string>& raw_terms) const {
     std::vector<PostingPointer> postings;
     for (const auto& term : raw_terms) {
         if (term_meta_mapping.find(term) != term_meta_mapping.end()) {

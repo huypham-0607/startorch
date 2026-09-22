@@ -20,7 +20,7 @@ Admittedly, applications of PageRank in citation graph is not a novel concepts, 
 
 ## Status
 
-As of September 19, 2026:
+As of September 21, 2026:
 
 ### Data pipeline : Done
 
@@ -32,9 +32,9 @@ About 42% of the English corpus are OpenAlex expansion records, mostly datasets 
 
 See [`docs/data_pipeline.md`](docs/data_pipeline.md).
 
-### Retrieval engine: Done
+### Lexical retrieval engine: Done
 
-The C++ retrieval engine is implemented and tested.
+The C++ lexical retrieval engine is implemented and tested.
 
 It currently supports:
 
@@ -45,23 +45,30 @@ It currently supports:
 - block-level upper-bound metadata
 - variable-byte encoded posting lists
 
-Index construction and querying are both working in C++, with 196 GoogleTest cases passing. The whole index is built in a single pass over the token stream.
+Index construction and querying are both working in C++, with 198 GoogleTest cases passing. The whole index is built in a single pass over the token stream.
 
 The engine is connected to Python CLI, which simple APIs for build posting lists, fetching data, and executing queries.
 
-Retrival engine is benchmarked in rank-safety, retrieval effectiveness, and query latency using both OpenAlex English subset and MS MARCO Passage Ranking datasets. On MS MARCO Passage Ranking it reaches MRR@10 0.1925 and Recall@1000 0.8778, slightly above Anserini BM25 at 0.1892 and 0.8573.
+Lexical retrival engine is benchmarked in rank-safety, retrieval effectiveness, and query latency using both OpenAlex English subset and MS MARCO Passage Ranking datasets. On MS MARCO Passage Ranking it reaches MRR@10 0.1925 and Recall@1000 0.8778, slightly above Anserini BM25 at 0.1892 and 0.8573.
 
 On the full English corpus, the loaded engine holds 6.7 GiB in memory, and needs about 8.7 GiB while loading. Posting lists are memory-mapped on top of that. A 16 GB machine is therefore the practical minimum.
 
 See [`docs/bmw_technical_report.md`](docs/bmw_technical_report.md).
 
-### Live service
+### Live service: In progress
 
-Not started yet.
+The HTTP API works and is tested locally. Deployment to AWS is not started.
 
-The engine only runs locally through the CLI. The plan is an HTTP API in Python, with index artifacts stored in S3 and served from a single EC2 instance.
+It currently supports:
 
-Three things are missing before that: concurrent queries (the pybind11 bindings hold the GIL for the whole search), result metadata (the index stores document IDs only, no titles), and request limits.
+- `/search`, `/healthz`, and `/readyz` endpoints
+- background index loading, so health checks answer during the load
+- up to 4 searches in parallel, on worker threads
+- limits on `k` and query length
+
+The query engine and tokenizer are thread-safe, and the engine releases the GIL while loading and searching. The C++ side is checked with ThreadSanitizer.
+
+Results carry OpenAlex IDs only; the client fetches titles from the OpenAlex API. Next steps are a Docker image, then the index in S3, served from a single EC2 instance.
 
 See [`docs/deployment.md`](docs/deployment.md).
 
@@ -87,9 +94,9 @@ A first version of the `startorch` CLI and shared `project-config.toml` configur
 
 The CLI currently supports the full retrieval pipeline, including data ingestion, test-subgraph generation, building inverted indicies & posting lists, and query engine.
 
-The package is organized by capability: `ingest`, `lexical`, and `utils`. Graph and semantic code will sit beside them, and the HTTP layer will live in `api`.
+The package is organized by capability: `ingest`, `lexical`, `utils`, and `api` for the HTTP layer. Graph and semantic code will sit beside them.
 
-A dependency-free smoke test covers the CLI surface, the config profiles, and path resolution.
+A pytest suite under `python/tests` covers the package wiring, the CLI, the tokenizer, search, and the HTTP API, including thread safety. Tests that need the MS MARCO index skip themselves when it is not built.
 
 ### Semantic retrieval
 
@@ -123,7 +130,7 @@ The future plan for this project is:
 - [x] C++ retrieval tests
 - [x] connect Python CLI to C++ retrieval
 - [x] benchmark retrieval engine
-- [ ] HTTP API layer
+- [x] HTTP API layer
 - [ ] EC2 + S3 deployment
 - [ ] CSR/CSC citation-graph representation
 - [ ] Global PageRank
@@ -144,7 +151,7 @@ startorch/
 │   │   ├── lexical/                    ✅ SPIMI index + Block-Max WAND query engine
 │   │   └── graph/                      CSR/CSC, PageRank, PPR
 │   ├── python/bindings.cpp             ✅ pybind11 module (startorch_cpp)
-│   ├── tests/                          ✅ 196 GoogleTest cases
+│   ├── tests/                          ✅ 198 GoogleTest cases
 │   └── benchmarks/                     benchmark datasets and future harnesses
 │
 ├── python/
@@ -154,11 +161,10 @@ startorch/
 │   │   ├── lexical/                    ✅ tokenizer.py, build_posting.py,
 │   │   │                                  doc_id_lookup.py, search.py
 │   │   ├── utils/                      ✅ paths.py, logger.py, misc.py, duckdb.py
-│   │   ├── api/                        HTTP layer
+│   │   ├── api/                        ✅ FastAPI app + response models
 │   │   └── _native/                    ✅ compiled startorch_cpp + type stub
 │   ├── benchmark/                      ✅ query sets, latency/correctness runs, report/
-│   ├── script/
-│   │   └── smoke_test.py               ✅ CLI smoke tests
+│   ├── tests/                          ✅ pytest suite: package, CLI, tokenizer, search, API
 │   └── notebook/                       exploratory analysis
 │
 ├── docs/

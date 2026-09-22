@@ -7,13 +7,17 @@
 #include "startorch/utils/vbe.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <format>
 #include <functional>
 #include <gtest/gtest.h>
+#include <latch>
+#include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -972,5 +976,131 @@ namespace QueryEndToEndTest {
         auto [after, after_elapsed] = QueryEngine(renamed_dir / file_names::METADATA_BIN).query({"cat", "dog"}, 4);
         EXPECT_FALSE(after.empty());
         EXPECT_EQ(after, before);
+    }
+}
+
+// ===========================================================================
+// Concurrency: one engine shared by many threads. Run under ThreadSanitizer
+// (a -fsanitize=thread build) to prove there is no data race, not just no crash.
+// ===========================================================================
+namespace QueryEngineConcurrencyTest {
+    class QueryEngineConcurrencyTest : public QueryEndToEndTest::QueryEndToEndTest {
+    protected:
+        static constexpr int THREADS = 8;
+        static constexpr int REPEATS = 3;
+
+        std::vector<std::vector<std::string>> queries;
+
+        // 400 documents, 12 terms from common to rare, block_size 4 so
+        // Block-Max WAND prunes across many blocks. Fixed seed: deterministic.
+        fs::path build_random_index() {
+            std::mt19937 rng(20260921);
+            const int docs = 400;
+            const std::vector<double> appear = {0.9, 0.7, 0.5, 0.35, 0.25, 0.15, 0.1, 0.06, 0.04, 0.02, 0.01, 0.005};
+
+            std::vector<std::pair<std::string, std::vector<std::pair<unsigned long long, unsigned int>>>> terms;
+            std::vector<unsigned int> doc_len(docs, 1);
+            for (size_t t = 0; t < appear.size(); t++) {
+                std::bernoulli_distribution present(appear[t]);
+                std::uniform_int_distribution<unsigned int> freq(1, 3);
+                std::vector<std::pair<unsigned long long, unsigned int>> postings;
+                for (int d = 0; d < docs; d++) {
+                    if (present(rng)) {
+                        unsigned int f = freq(rng);
+                        postings.emplace_back(d, f);
+                        doc_len[d] += f;
+                    }
+                }
+                if (postings.empty()) postings.emplace_back(t, 1);
+                terms.emplace_back("t" + std::to_string(t), std::move(postings));
+            }
+
+            std::vector<std::pair<unsigned long long, unsigned int>> lengths;
+            for (int d = 0; d < docs; d++) lengths.emplace_back(d, doc_len[d]);
+            write_doc_len_list(lengths);
+            write_raw_block_multi(file_names::partial_block_file_name(0), terms);
+
+            // Every single term, every adjacent pair and triple, one unindexed term, and the empty query.
+            for (size_t t = 0; t < appear.size(); t++) queries.push_back({"t" + std::to_string(t)});
+            for (size_t t = 0; t + 1 < appear.size(); t++) queries.push_back({"t" + std::to_string(t), "t" + std::to_string(t + 1)});
+            for (size_t t = 0; t + 2 < appear.size(); t++) {
+                queries.push_back({"t" + std::to_string(t), "t" + std::to_string(t + 1), "t" + std::to_string(t + 2)});
+            }
+            queries.push_back({"t0", "unindexed"});
+            queries.push_back({});
+
+            return build_index(1.2f, 0.75f, /*block_size=*/4);
+        }
+    };
+
+    TEST_F(QueryEngineConcurrencyTest, SharedEngineGivesSequentialResultsUnderConcurrentQueries) {
+        const fs::path meta_path = build_random_index();
+        const QueryEngine engine(meta_path);
+        const std::vector<int> ks = {1, 5, 20};
+
+        // Ground truth, computed on one thread.
+        std::vector<QueryResult> expected_bmw, expected_exhaustive;
+        for (const auto& terms : queries) {
+            for (int k : ks) {
+                expected_bmw.push_back(engine.query(terms, k).first);
+                expected_exhaustive.push_back(engine.query_exhaustive(terms, k).first);
+            }
+        }
+
+        std::atomic<int> mismatches{0};
+        std::atomic<int> exceptions{0};
+        std::latch start(THREADS);   // release every thread at once, to maximize overlap
+        std::vector<std::thread> threads;
+        for (int t = 0; t < THREADS; t++) {
+            threads.emplace_back([&, t] {
+                start.arrive_and_wait();
+                try {
+                    for (int r = 0; r < REPEATS; r++) {
+                        // Each thread starts at a different query, so different threads
+                        // walk the same posting lists at the same moment.
+                        for (size_t i = 0; i < queries.size(); i++) {
+                            const size_t q = (i + t * 7) % queries.size();
+                            for (size_t j = 0; j < ks.size(); j++) {
+                                const size_t slot = q * ks.size() + j;
+                                if (engine.query(queries[q], ks[j]).first != expected_bmw[slot]) ++mismatches;
+                                if (engine.query_exhaustive(queries[q], ks[j]).first != expected_exhaustive[slot]) ++mismatches;
+                            }
+                        }
+                    }
+                } catch (...) {
+                    ++exceptions;
+                }
+            });
+        }
+        for (auto& thread : threads) thread.join();
+
+        EXPECT_EQ(exceptions.load(), 0);
+        EXPECT_EQ(mismatches.load(), 0) << "a concurrent query differed from its sequential result";
+        // Sanity: the pruned engine still matches the exhaustive one on this data.
+        EXPECT_EQ(expected_bmw, expected_exhaustive);
+    }
+
+    TEST_F(QueryEngineConcurrencyTest, EnginesConstructedConcurrentlyAreIdentical) {
+        const fs::path meta_path = build_random_index();
+        const auto expected = QueryEngine(meta_path).query({"t0", "t3", "t6"}, 20).first;
+
+        std::vector<QueryResult> got(THREADS);
+        std::atomic<int> exceptions{0};
+        std::latch start(THREADS);
+        std::vector<std::thread> threads;
+        for (int t = 0; t < THREADS; t++) {
+            threads.emplace_back([&, t] {
+                start.arrive_and_wait();
+                try {
+                    got[t] = QueryEngine(meta_path).query({"t0", "t3", "t6"}, 20).first;
+                } catch (...) {
+                    ++exceptions;
+                }
+            });
+        }
+        for (auto& thread : threads) thread.join();
+
+        EXPECT_EQ(exceptions.load(), 0);
+        for (int t = 0; t < THREADS; t++) EXPECT_EQ(got[t], expected) << "engine " << t;
     }
 }

@@ -9,6 +9,8 @@ Attributes:
     STOP_WORDS: Regex of English stopwords, removed before splitting into tokens.
 """
 
+import threading
+
 import duckdb as db
 import numpy as np
 import pyarrow as pa
@@ -119,14 +121,19 @@ def profile_source(profile: Profile) -> str:
 
 
 class Tokenizer:
-    """Tokenizes documents and queries through one in-memory DuckDB connection.
+    """Tokenizes documents and queries through one in-memory DuckDB database.
 
     Documents and queries share token_expression(), so a query is tokenized
     exactly the way the indexed documents were.
 
+    tokenize_query() is thread-safe: a DuckDB connection is not, so each thread
+    gets its own cursor (an independent connection to the same database) on first
+    use. The build methods are single-threaded by design and run on con.
+
     Attributes:
         stop_word_list: The stopword regex applied before splitting.
-        con: The DuckDB connection every tokenizing query runs on.
+        con: The DuckDB connection the build methods run on, and the parent of
+            every thread's cursor.
     """
 
     def __init__(
@@ -135,13 +142,35 @@ class Tokenizer:
         """Opens an in-memory DuckDB connection."""
         self.stop_word_list = STOP_WORDS
         self.con = db.connect()
+        self._local = threading.local()
+        self._cursors = []
+        self._cursors_lock = threading.Lock()
 
     def close(self) -> None:
-        """Closes the DuckDB connection, releasing its memory.
+        """Closes every thread's cursor and the connection, releasing their memory.
 
-        Call this before the C++ build runs in the same process.
+        Call this before the C++ build runs in the same process. The tokenizer
+        cannot be used afterwards.
         """
+        with self._cursors_lock:
+            for cursor in self._cursors:
+                cursor.close()
+            self._cursors.clear()
         self.con.close()
+
+    def _cursor(self) -> db.DuckDBPyConnection:
+        """Returns the calling thread's DuckDB cursor, creating it on first use.
+
+        Cursors are kept until close(), so a thread that exits leaves its cursor
+        behind. Server threadpools reuse threads, so the count stays bounded.
+        """
+        cursor = getattr(self._local, "cursor", None)
+        if cursor is None:
+            with self._cursors_lock:
+                cursor = self.con.cursor()
+                self._cursors.append(cursor)
+            self._local.cursor = cursor
+        return cursor
 
     @staticmethod
     def token_stream_file_name(idx: int) -> str:
@@ -347,13 +376,15 @@ class Tokenizer:
     def tokenize_query(self, query: str) -> list[str]:
         """Tokenizes a query exactly the way documents were tokenized.
 
+        Thread-safe: runs on the calling thread's own cursor.
+
         Args:
             query: Free-text query.
 
         Returns:
             The query's stemmed tokens, stopwords removed. May be empty.
         """
-        res = fetch_one(self.con.sql(
+        res = fetch_one(self._cursor().sql(
             f"SELECT {token_expression('$query')} AS tokens",
             params={"query": query}
         ))
