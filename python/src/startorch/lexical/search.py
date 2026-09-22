@@ -106,6 +106,13 @@ class Searcher:
         """
         return [self.search(query, k, exhaustive) for query in queries]
 
+    def close(self) -> None:
+        """Closes the tokenizer's DuckDB connection.
+
+        The loaded index is freed once the last reference to this Searcher goes.
+        """
+        self.tokenizer.close()
+
 
 def read_query_file(path: Path, cap: int | None = None) -> list[tuple[str, str]]:
     """Reads a tab-separated query set.
