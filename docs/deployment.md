@@ -7,23 +7,23 @@ Two rules shaped it: **write as little as possible**, and **depend on as little 
 against each other, so where a managed service costs real money or real setup time, this picks the boring
 option that ships.
 
-Last updated 2026-09-22. The current status is in the next section. Check current docs before pinning versions.
+Last updated 2026-09-26. The current status is in the next section. Check current docs before pinning versions.
 
 ---
 
 ## Status
 
-**The API and the search page work and are tested locally. Nothing is deployed yet.**
+**The whole site runs locally in Docker Compose, on full-en, behind Caddy. Nothing is deployed to AWS yet.**
 
 | Step | Status | Notes |
 |---|---|---|
 | 1. FastAPI wrapper | Done | `/api/search`, `/api/healthz`, `/api/readyz`. No result cache yet. |
 | 2. Concurrency | Done | The GIL is released. The engine and tokenizer are thread-safe. 4 searches run at a time. |
 | 3. Results without a metadata store | Done | The API returns OpenAlex ids with the `W` prefix. The page fetches titles from OpenAlex. |
-| 4. Front end | Done | One static page in `frontend/`, served by FastAPI in development and by Caddy in production. |
-| 5. Docker image | Not started | |
+| 4. Front end | Done | One static page in `frontend/`, served by FastAPI in development and by Caddy under Compose. |
+| 5. Docker image | Done | Two-stage `Dockerfile`, about 920 MB. Slimming it is optional. |
 | 6. Index in S3 | Not started | The full-en and msmarco indexes are built in the current format, ready to upload. |
-| 7. Compose + Caddy | Not started | The Caddy setup, with and without a domain, is planned in step 7. |
+| 7. Compose + Caddy | Done locally | `compose.yaml`, `Caddyfile`, `.env`. Plain HTTP on port 80. Not on EC2 yet; no systemd unit, no domain. |
 | 8. Protection | Partly done | Input limits and the search limit are in. No request timeout yet. |
 | 9. Operations | Not started | The health endpoints are ready for an uptime monitor. |
 
@@ -47,8 +47,10 @@ Last updated 2026-09-22. The current status is in the next section. Check curren
   - `node --test frontend/tests/` runs the page's formatting tests.
   - `ctest` runs 198 C++ tests.
   - Browser behavior is covered by the manual checklist in `frontend/TESTING.md`.
-- **Run it locally.** From `python/`, run `STARTORCH_PROFILE=full-en fastapi dev src/startorch/api/api.py`, then
-  open `http://127.0.0.1:8000/`. Without the variable, the profile is `msmarco`, whose results have no titles.
+- **Run it locally, without Docker.** From `python/`, run `STARTORCH_PROFILE=full-en fastapi dev src/startorch/api/api.py`,
+  then open `http://127.0.0.1:8000/`. Without the variable, the profile is `msmarco`, whose results have no titles.
+- **Run it locally, in Docker.** From the repository root, run `docker compose up -d --build`, then open
+  `http://localhost/`. The profile and the index location come from `.env` (step 7).
 
 ### Measurements
 
@@ -65,8 +67,11 @@ Last updated 2026-09-22. The current status is in the next section. Check curren
 | Search time, full-en, the page's example queries | 30 to 50 ms for 20 results |
 | Search time, full-en, common-word queries | up to about 600 ms for 10 results |
 | Time from opening a search link to results, during a full-en load | 17 s; the page waits and then searches by itself |
+| full-en in Compose: time to ready, memory after load | about 16 s, 7.0 GiB |
+| Docker image | about 920 MB |
 
-So the target is one instance with 16 GiB of RAM and about 70 GB of disk.
+So the target is one instance with 16 GiB of RAM, a 30 GB root volume (OS, Docker, images and build cache), and
+an 80 GB gp3 data volume for the 56 GB index.
 
 **Result quality on full-en.** Many queries return mostly OpenAlex expansion records: datasets, software, and
 "other" items with no citations. Their title-only text is short, and BM25 favors short documents. For example,
@@ -75,11 +80,12 @@ were chosen from those whose top 10 are 9 or 10 scholarly works. PageRank is exp
 
 ### Next
 
-1. Write the Dockerfile, `compose.yaml` and Caddyfile (steps 5 and 7). Test them locally with the msmarco profile.
-2. Add a request timeout and the result cache (steps 1 and 8).
-3. Upload the full-en index to S3, and run it on EC2 (steps 6 and 7).
+1. Add a request timeout and the result cache (steps 1 and 8).
+2. Upload the full-en index to S3, and run the Compose stack on EC2 (steps 6 and 7).
+3. Add the systemd unit, so the stack comes back after a reboot (step 7).
 4. Buy a domain, point it at the Elastic IP, and switch Caddy to HTTPS (step 7).
 5. Set up the uptime monitor and the budget alarm (step 9).
+6. Optional: slim the image (step 5).
 
 **Still open:** whether the instance runs all the time, or only for demos.
 
@@ -100,7 +106,7 @@ were chosen from those whose top 10 are 9 or 10 scholarly works. PageRank is exp
 | Index storage | **S3**, copied to an EBS volume with the **AWS CLI** | CLI preinstalled on Amazon Linux |
 | Machine | **one EC2 instance**, 16 GiB RAM | plus an AMI snapshot once it works |
 | Shell access | **SSM Session Manager** | agent preinstalled, no SSH keys or port 22 |
-| Logs | **journald** (`journalctl -u startorch`) | already there |
+| Logs | **`docker compose logs`** | Docker keeps them; its `journald` log driver can send them to journald |
 | Uptime check | a **free external monitor** hitting `/api/healthz` | UptimeRobot, Better Stack, or similar |
 | Cost safety | **AWS Budgets** alarm | free, set it first |
 | Load test | **the existing `bmw_performance.py`** | already written |
@@ -229,26 +235,47 @@ between the two.
 
 **Research.** Pico.css, `fetch` and `AbortController`, `history.pushState`, `URLSearchParams`, `node:test`.
 
-## Step 5. Build the image with Docker
+## Step 5. Build the image with Docker — done
 
 **Goal.** One image that runs the same on your machine and on the instance.
 
-**The Dockerfile, in two stages.**
-- *Builder*: a base with a C++20 compiler, CMake and **uv**. Copy `cpp/` and `python/`, run
-  `cmake -S cpp -B cpp/build && cmake --build cpp/build -j`, then `uv sync --frozen`. Add a CMake option to
-  skip the GoogleTest fetch, so server builds don't download a test framework.
-- *Runtime*: a slim Python base. Copy the built package and the `.so` from the builder. No compiler in the
-  final image.
+**Built** (`Dockerfile` and `.dockerignore`, at the repository root). Two stages, both on `python:3.14-slim`:
+- *Build stage.* Installs a compiler, CMake, git, and uv (pinned, through pip). Then three layers, in this order:
+  1. `pyproject.toml` and `uv.lock` only, then `uv sync --frozen --no-dev --no-install-project`: the
+     dependencies.
+  2. `cpp/`, then CMake builds only the `startorch_cpp` target. The `.so` lands in `python/src/startorch/_native/`.
+  3. `python/` and `project-config.toml`, then `uv sync --frozen --no-dev` again, to install the package itself.
+- *Runtime stage.* Copies `python/` (the venv, the source and the `.so`) and `project-config.toml` from the build
+  stage. No compiler. It also installs DuckDB's `fts` extension and copies `frontend/`.
+- `CMD` runs one Uvicorn process on `0.0.0.0:8000`.
 
-**Getting the layers right is most of the lesson.** Copy dependency manifests and run `uv sync` *before*
-copying source, so editing a `.py` file doesn't reinstall every package. Put the C++ build after that, since it
-changes less often than Python code but more often than dependencies.
+**Layer order is most of the lesson.** Dependencies change least, then C++, then Python. So editing a `.py` file
+rebuilds only the last layers, and the C++ build is reused.
 
 **The index never goes in the image.** It is 56 GB, it changes on a different schedule, and an image is not a
-data store. It lives on the host and is bind-mounted read-only (steps 6 and 7).
+data store. It lives on the host and is bind-mounted read-only at `/data/scholar_rank`, because every path in
+the baked-in `project-config.toml` starts there (steps 6 and 7).
 
-**The page does not go in this image either.** Caddy serves `frontend/` from its own container (step 7). Without
-the folder, FastAPI simply skips its development-only page mount.
+**The page is in the image, for plain `docker run`.** Under Compose, Caddy serves its own copy of `frontend/`
+(step 7), and the app never sees page requests.
+
+**What went wrong on the way, and the fixes.**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'startorch'` | The first `uv sync` installs dependencies only | A second `uv sync` after copying the source |
+| `ImportError: GLIBCXX_3.4.36 not found` | In `.dockerignore`, `*.so` matches only the context root. The host's `.so`, built by a newer GCC, was copied over the one built in the image | `**/*.so` |
+| Searches return 500 when the container has no network | DuckDB downloads `fts` (the query stemmer) on the first search, into the container | `INSTALL fts` in the runtime stage |
+| full-en is OOM-killed, even with `-m 16g` | Docker Desktop runs containers in a VM, which had 7.4 GiB. `-m` cannot go above it | Raise Docker Desktop's memory (now 11.67 GiB). EC2 has no such VM |
+| `/` returns 404 | `frontend/` was not in the runtime stage | `COPY frontend/ frontend/` |
+
+**Not done yet, all optional.**
+- A CMake option to skip the GoogleTest fetch. It costs build time only.
+- A non-root `USER`. Run `INSTALL fts` after it, so the extension lands in that user's home.
+- Move analysis-only packages (pandas, matplotlib, ipykernel, tabulate) into a dependency group, which
+  `--no-dev` skips. Largest packages now: pyarrow 152 MB, duckdb 58 MB, pandas 42 MB, jedi 33 MB, matplotlib 28 MB.
+- Exclude `frontend/tests/` and `frontend/TESTING.md` in `.dockerignore`. Under plain `docker run`, FastAPI serves
+  them. Caddy already hides them (step 7).
 
 **Two things that bite here specifically.**
 - **Architecture.** Build for the architecture you deploy on. If you develop on x86_64 and deploy on Graviton,
@@ -260,17 +287,27 @@ the folder, FastAPI simply skips its development-only page mount.
 **Research.** Docker multi-stage builds, layer caching and COPY order, `.dockerignore` (exclude `cpp/build/`,
 `.venv/`, `python/.tmp/`), BuildKit cache mounts, `docker buildx --platform`, slim vs distroless base images.
 
-Running the image:
+Running the image alone, without Compose, serves the API and the page on `http://localhost:8000/`:
 ```
 docker run -p 8000:8000 -e STARTORCH_PROFILE=full-en -v /data/scholar_rank:/data/scholar_rank:ro startorch
-
 ```
+
+When a container exits, `docker inspect <name> --format '{{.State.ExitCode}} {{.State.OOMKilled}}'` tells a crash
+from an OOM kill (exit code 137 with `OOMKilled=true`), and `docker logs <name>` shows its last output.
 
 ## Step 6. Index to S3, then to the instance
 
-- Upload the serving files (not `token_stream/`, not `partial/`) to a versioned prefix:
-  `aws s3 sync <dir> s3://<bucket>/indexes/full-en/2026-09-19/`.
+- Upload the serving files (not `token_stream/`, not `posting/partial/`) to a versioned prefix:
+  ```
+  aws s3 sync /data/scholar_rank/posting/full-en s3://<bucket>/indexes/full-en/2026-09-19/ \
+      --exclude "token_stream/*" --exclude "posting/partial/*"
+  ```
 - On the instance, `aws s3 sync` it down to a gp3 volume. About 56 GB, so several minutes.
+- **Keep the layout.** The image reads its paths from `project-config.toml`, all under `/data/scholar_rank`.
+  Serving full-en needs `posting/full-en/posting/` (49 GiB, without `partial/`) and `posting/full-en/lookup/`
+  (3.9 GiB).
+  So download into `<volume>/posting/full-en/`, and set `INDEX_ROOT=<volume>` in `.env` (step 7). Compose
+  then mounts `<volume>` at `/data/scholar_rank` in the container.
 - Turn on **S3 versioning** and keep the previous build until the new one has served traffic.
 - Snapshot the data volume once it is populated, so a rebuilt instance skips the download.
 
@@ -279,21 +316,61 @@ fault would become a network round trip.
 
 **Research.** `aws s3 sync`, S3 versioning, EBS gp3 throughput, EBS snapshots, VPC gateway endpoint for S3.
 
-## Step 7. Run it with Compose, behind Caddy
+## Step 7. Run it with Compose, behind Caddy — done locally
 
-**Two services in one `compose.yaml`.**
-- `startorch`: your image, running Uvicorn, with `STARTORCH_PROFILE=full-en`. No published ports: only Caddy
-  reaches it, by service name on the Compose network. Bind-mount the index read-only: `/data/index:/index:ro`.
-- `caddy`: the official image, publishing 80 and 443. It serves the page and proxies `/api/*` to
-  `startorch:8000`. Mount `frontend/` read-only at `/srv/frontend`, and the Caddyfile at `/etc/caddy/Caddyfile`.
-  Give it a named volume for `/data`, or it re-requests certificates on every restart and hits Let's Encrypt's
-  rate limits.
+**Built** (`compose.yaml`, `Caddyfile`, and a gitignored `.env`, at the repository root). Tested locally on
+full-en on 2026-09-26. Not on EC2 yet.
 
-**The Caddyfile, before you have a domain.** Caddy serves plain HTTP on port 80, at the instance's Elastic IP,
-for example `http://203.0.113.10/`:
+**Two services in `compose.yaml`.**
+- `startorch`: builds the image from the `Dockerfile`'s `runtime` stage.
+  - `STARTORCH_PROFILE` comes from `.env`, with `msmarco` as the default.
+  - The index is bind-mounted read-only: `${INDEX_ROOT:-/data/scholar_rank}:/data/scholar_rank:ro`. The right
+    side is fixed by `project-config.toml`; only the left side changes between machines.
+  - `mem_limit` and `memswap_limit` are both 12g, and `restart: unless-stopped`.
+  - No published ports. Only Caddy reaches it, at `startorch:8000`: on the Compose network, a service's name is
+    its hostname.
+- `caddy`: the official `caddy:2` image, publishing port 80.
+  - Bind mounts, read-only: `./Caddyfile` at `/etc/caddy/Caddyfile`, the path the image's default command reads,
+    and `./frontend` at `/srv/frontend`. Compose resolves `./` against the folder holding `compose.yaml`, so these
+    work wherever the repository is cloned.
+  - Named volumes: `caddy_data` at `/data`, which holds certificates, and `caddy_config` at `/config`. Without
+    `caddy_data`, every recreated container requests new certificates and hits Let's Encrypt's rate limits.
+
+**`.env`, one per machine.** Compose reads it only to fill in `${...}` in `compose.yaml`. The `environment:` key
+is what passes the profile into the container. Use `KEY=value`, which systemd's `EnvironmentFile` and
+`docker run --env-file` also read:
+
+```
+STARTORCH_PROFILE=full-en
+INDEX_ROOT=/data/scholar_rank
+```
+
+**Run and check it.**
+
+```
+docker compose up -d --build
+docker compose logs -f startorch      # wait for "Index for profile full-en is loaded"
+```
+
+| Check (2026-09-26, local, full-en) | Result |
+|---|---|
+| `/api/readyz` through Caddy | 200 after about 16 s |
+| A search through Caddy | 30 to 40 ms |
+| `/`, `/app.js`, `/style.css` | 200, served by Caddy |
+| `/TESTING.md`, `/tests/format.test.js` | 404 |
+| `localhost:8000` | Unreachable: the app publishes no port |
+| Memory | App 7.0 GiB, Caddy 36 MiB, no OOM kill |
+
+**The Caddyfile, before you have a domain.** Caddy serves plain HTTP on port 80. On EC2, that is the instance's
+Elastic IP, for example `http://203.0.113.10/`:
 
 ```
 :80 {
+    @hidden path /tests/* /TESTING.md
+
+    handle @hidden {
+        respond 404
+    }
     handle /api/* {
         reverse_proxy startorch:8000
     }
@@ -304,26 +381,36 @@ for example `http://203.0.113.10/`:
 }
 ```
 
+- **`:80`** is the site address: any hostname, port 80. It decides whether Caddy uses HTTPS.
+- **`@hidden`** is a named matcher. It names a condition once, here two paths, for directives to use.
+- **The `handle` blocks** are mutually exclusive: a request runs only the first one that matches, and the block
+  with no matcher always goes last. The hidden files get a 404, `/api/*` goes to the app, and everything else is
+  a file from `/srv/frontend`.
+- **Inside the last block**, `root` sets the folder and `file_server` serves from it, including `index.html` for `/`.
+
 This is enough to test the whole site on EC2. But there is no HTTPS: a normal Let's Encrypt certificate needs a
 domain name. Browsers mark the page "Not secure", so do not send this address to recruiters.
+
+**Two things that bit here.**
+- **Caddy sorts directives.** It does not run a site block's directives in the order written. A bare
+  `respond @hidden 404` next to the `handle` blocks runs after them, so the files were still served. Inside its
+  own `handle` block, it works.
+- **Editing a single-file bind mount.** The mount is tied to the file's inode. Many editors save by writing a new
+  file, and the container then keeps the old content, so `caddy reload` reloads the old file. After editing the
+  Caddyfile, run `docker compose up -d --force-recreate caddy`. Mounting a folder instead of the file avoids this.
 
 **The Caddyfile, once you have a domain.**
 1. Buy a domain from any registrar (Route 53, Cloudflare, Porkbun, and others all work).
 2. Add a DNS A record: `search.yourdomain.com` → the Elastic IP.
-3. In the Caddyfile, replace `:80` with the name. Keep the two `handle` blocks the same:
+3. In the Caddyfile, replace `:80` with the name. Keep the matcher and the three `handle` blocks the same:
 
    ```
    search.yourdomain.com {
-       handle /api/* {
-           reverse_proxy startorch:8000
-       }
-       handle {
-           root * /srv/frontend
-           file_server
-       }
+       ...
    }
    ```
-4. Reload Caddy: `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`.
+4. In `compose.yaml`, publish `"443:443"` on the `caddy` service too, and `"443:443/udp"` for HTTP/3.
+5. Recreate Caddy: `docker compose up -d --force-recreate caddy`.
 
 Caddy then gets a Let's Encrypt certificate by itself, renews it, and redirects HTTP to HTTPS. Keep ports 80
 and 443 open: port 80 answers the certificate check and serves the redirect.
@@ -346,12 +433,14 @@ choosing a number:
   rather than failure.
 - Set the limit too close to the heap and the container is OOM-killed mid-load. That looks like a mysterious
   crash with no traceback; check `docker inspect` for `OOMKilled` before debugging anything else.
+- On Docker Desktop, containers run inside a VM, and the VM's memory is the real ceiling. A `mem_limit` above
+  it does nothing. Raise it under Settings → Resources. On EC2, Docker runs on the host directly.
 
 Also set `restart: unless-stopped`, and keep swap off for the container (`memswap_limit` equal to `mem_limit`).
 Swapped heap hurts far more than evicted posting pages.
 
-**Supervision.** A small systemd unit runs `docker compose up` on boot, so the stack survives a reboot without
-Docker's restart policy being the only thing holding it together.
+**Supervision, not done yet.** A small systemd unit runs `docker compose up` on boot, so the stack survives a
+reboot without Docker's restart policy being the only thing holding it together.
 
 **Networking.** Security group: 80 and 443 open, nothing else. Shell access through SSM Session Manager.
 
@@ -370,7 +459,9 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
 
 ## Step 9. Minimal operations
 
-- **Logs:** `journalctl -u startorch -f`. Uvicorn's access log is enough to see traffic and errors.
+- **Logs:** `docker compose logs -f startorch`. Uvicorn's access log is enough to see traffic and errors. Docker
+  keeps logs in its own files, so cap them with the `logging:` key's `max-size`, or switch to the `journald` log
+  driver to read them with `journalctl`.
 - **Uptime:** a free external monitor pinging `/api/healthz` every few minutes, alerting by email.
 - **Cost:** an AWS Budgets alarm, set before the first full-size instance runs overnight. A 16 GiB instance
   running 24/7 is the dominant cost; stopping it when not in use is the simplest saving, and an Elastic IP plus
@@ -380,7 +471,6 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
   against the public address.
 - **Deploy:** `git pull`, `docker compose build`, `docker compose up -d`. Compose recreates only what changed.
   About a minute of downtime while the index reloads.
-- **Container logs:** `docker compose logs -f startorch`, which journald still captures underneath.
 
 ---
 
@@ -402,4 +492,9 @@ and `memswap_limit`, cgroup v2 memory accounting for page cache, `OOMKilled` in 
    with no abstracts (steps 4 and 7).
 4. **Decided:** xpac and deleted works stay in the index for now. PageRank should push them down, and the page
    shows fallback cards for deleted ones (steps 3 and 4).
-5. **Open:** whether the instance runs all the time, or only when you demo it.
+5. **Decided:** Compose runs the app and Caddy. Caddy serves the page, so the page stays up when the app is
+   down, and it will handle HTTPS once there is a domain (step 7).
+6. **Decided:** the profile and the index location come from `.env`, so one `compose.yaml` serves every machine
+   (step 7).
+7. **Decided:** the page is also in the image, so plain `docker run` serves the whole site (step 5).
+8. **Open:** whether the instance runs all the time, or only when you demo it.

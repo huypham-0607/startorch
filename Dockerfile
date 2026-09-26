@@ -39,6 +39,9 @@ WORKDIR /app
 COPY --from=build /app/python /app/python          
 COPY --from=build /app/project-config.toml /app/
 
+# Bake DuckDB's fts extension (the query stemmer) into the image.
+RUN /app/python/.venv/bin/python -c "import duckdb; duckdb.sql('INSTALL fts')"
+
 # Copy front-end
 COPY frontend/ frontend/
 

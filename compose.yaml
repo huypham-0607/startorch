@@ -1,0 +1,33 @@
+services:
+    startorch:
+        image: startorch
+        pull_policy: never
+        container_name: startorch
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: runtime
+        environment:
+            STARTORCH_PROFILE: ${STARTORCH_PROFILE:-msmarco}
+        volumes:
+            - ${INDEX_ROOT:-/data/scholar_rank}:/data/scholar_rank:ro
+        mem_limit: 12g
+        memswap_limit: 12g
+        restart: unless-stopped
+    caddy:
+        image: caddy:2
+        container_name: caddy
+        ports:
+            - "80:80"
+        volumes:
+            - ./Caddyfile:/etc/caddy/Caddyfile:ro   # Serving Caddyfile
+            - ./frontend:/srv/frontend:ro           # Serving front-end
+            - caddy_data:/data                      # Certificates
+            - caddy_config:/config                  # Optional - Saving the last config
+        depends_on:
+            - startorch
+        restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

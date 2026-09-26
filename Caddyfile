@@ -1,0 +1,18 @@
+# Plain HTTP on port 80. Once there is a domain, replace ":80" with it, e.g. "search.example.com".
+:80 {
+	# Test files that sit in frontend/ but are not part of the site.
+	@hidden path /tests/* /TESTING.md
+
+	# handle blocks are mutually exclusive: a request runs only the first one that matches.
+	# The block with no matcher always goes last, so it catches everything else.
+	handle @hidden {
+		respond 404
+	}
+	handle /api/* {
+		reverse_proxy startorch:8000
+	}
+	handle {
+		root * /srv/frontend
+		file_server
+	}
+}

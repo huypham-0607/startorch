@@ -27,3 +27,6 @@ initialization.md
 
 # Duckdb Cache
 .tmp/
+
+# Environment variable
+.env
