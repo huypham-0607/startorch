@@ -1,0 +1,26 @@
+# Cpp
+cpp/.cache/
+cpp/build/
+
+# Python
+# Must be **/*.so: a bare *.so only matches the context root, so the host-built
+# extension would be copied in and shadow the one compiled inside the image.
+**/*.so
+python/.venv/
+python/.tmp/
+**/__pycache__/
+**/.pytest_cache/
+python/benchmark/
+python/notebook/
+python/tests/
+
+
+# Front-end
+# frontend/
+
+# General
+.git/
+data/
+Logs/
+papers/
+docs/

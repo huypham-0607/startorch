@@ -8,6 +8,8 @@ data/
 # Python
 __pycache__/
 *.so
+*/.pytest_cache
+*/py.typed
 
 # Makefiles
 */build/

@@ -260,6 +260,12 @@ the folder, FastAPI simply skips its development-only page mount.
 **Research.** Docker multi-stage builds, layer caching and COPY order, `.dockerignore` (exclude `cpp/build/`,
 `.venv/`, `python/.tmp/`), BuildKit cache mounts, `docker buildx --platform`, slim vs distroless base images.
 
+Running the image:
+```
+docker run -p 8000:8000 -e STARTORCH_PROFILE=full-en -v /data/scholar_rank:/data/scholar_rank:ro startorch
+
+```
+
 ## Step 6. Index to S3, then to the instance
 
 - Upload the serving files (not `token_stream/`, not `partial/`) to a versioned prefix:

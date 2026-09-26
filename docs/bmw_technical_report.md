@@ -205,7 +205,7 @@ All block level operations are done **in-memory**, and the algorithm is designed
 | Kernel version | Linux 7.1.8 |
 | Compiler | g++ (GCC) 16.2.1 |
 | Language standards | `-std=c++20` |
-| Optimization flags | -O0 |
+| Optimization flags | -O3 |
 | BMW block size | 128 |
 
 ### OpenAlex query sets
