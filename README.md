@@ -20,7 +20,7 @@ Admittedly, applications of PageRank in citation graph is not a novel concepts, 
 
 ## Status
 
-As of September 21, 2026:
+As of September 29, 2026:
 
 ### Data pipeline : Done
 
@@ -57,7 +57,7 @@ See [`docs/bmw_technical_report.md`](docs/bmw_technical_report.md).
 
 ### Live service: In progress
 
-The HTTP API works and is tested locally. Deployment to AWS is not started.
+Containerization is all set up. The whole site runs locally in Docker on the full English corpus. What is left is to upload the index to AWS, run it on a single EC2 instance, and test it there.
 
 It currently supports:
 
@@ -69,7 +69,16 @@ It currently supports:
 
 The query engine and tokenizer are thread-safe, and the engine releases the GIL while loading and searching. The C++ side is checked with ThreadSanitizer.
 
-Results carry OpenAlex IDs only; the client fetches titles from the OpenAlex API. Next steps are a Docker image, then the index in S3, served from a single EC2 instance.
+Results carry OpenAlex IDs only; the client fetches titles from the OpenAlex API.
+
+The container setup consists of:
+
+- a two-stage Docker image, which builds the C++ engine and ships a slim Python runtime
+- Docker Compose, running the API behind Caddy, which serves the page and proxies `/api`
+- the index kept outside the image, mounted read-only
+- one `.env` file per machine, for the index profile and location
+
+The service will run at `startorch.halzyonnn.dev`, with HTTPS from Caddy. It is a demo, so the instance runs only when needed, to keep costs around $30 a month.
 
 See [`docs/deployment.md`](docs/deployment.md).
 
@@ -132,6 +141,8 @@ The future plan for this project is:
 - [x] connect Python CLI to C++ retrieval
 - [x] benchmark retrieval engine
 - [x] HTTP API layer
+- [x] search page
+- [x] Docker image and Compose setup
 - [ ] EC2 + S3 deployment
 - [ ] CSR/CSC citation-graph representation
 - [ ] Global PageRank
@@ -180,6 +191,9 @@ startorch/
 │   └── data_reference.md               OpenAlex field reference
 │
 ├── project-config.toml                 ✅ shared paths and subset configuration
+├── Dockerfile                          ✅ two-stage image: C++ build, slim runtime
+├── compose.yaml                        ✅ API + Caddy services
+├── Caddyfile                           ✅ serves the page, proxies /api
 ├── data/                               local data; gitignored
 └── README.md
 ```

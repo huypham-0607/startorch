@@ -17,6 +17,8 @@ python/tests/
 
 # Front-end
 # frontend/
+frontend/tests/
+frontend/TESTING.md
 
 # General
 .git/
