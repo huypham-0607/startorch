@@ -17,8 +17,12 @@ services:
     caddy:
         image: caddy:2
         container_name: caddy
+        environment:
+            SITE_ADDRESS: ${SITE_ADDRESS:-:80}
         ports:
             - "80:80"
+            - "443:443"
+            - "443:443/udp"
         volumes:
             - ./Caddyfile:/etc/caddy/Caddyfile:ro   # Serving Caddyfile
             - ./frontend:/srv/frontend:ro           # Serving front-end

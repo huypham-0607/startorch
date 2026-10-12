@@ -101,8 +101,16 @@ is charged all month, running or not, so it is kept small (us-east-1 on-demand p
 1. **Set a budget alarm first.** Billing → Budgets → a monthly cost budget of $30, with email alerts at 50%, 80%
    and 100%, and one on the *forecasted* amount, which warns early when an instance was left running. New
    accounts may also have Free Tier credits; check Billing → Credits.
-2. **Set up the AWS CLI with an IAM user or IAM Identity Center, never root keys.** Run `aws configure`, and pick
-   one region for everything. The bucket and the instance must be in the same region, so the S3 download is free.
+2. **Two IAM identities, never root keys.** Pick one region for everything: the bucket and the instance must
+   share it, so the S3 download is free.
+   - **Your console user,** in an `admins` group with `AdministratorAccess`. Password and MFA, no access keys.
+     Once, as root, activate billing access for IAM users, or Budgets stays hidden.
+   - **`startorch-cli`,** for your machine. No console access, one access key, and one custom policy: list the
+     bucket, read and write its objects (no delete), `ec2:DescribeInstances`, and start or stop only instances
+     tagged `project=startorch`.
+   - On your machine: `aws configure --profile startorch`, then `export AWS_PROFILE=startorch`. Check it with
+     `aws sts get-caller-identity`. The keys sit unencrypted in `~/.aws/credentials`, which is why this user is
+     narrow.
 3. **Make the site address a variable,** so one Caddyfile serves `:80` locally and the domain on EC2. Caddy reads
    `{$NAME:default}` from its environment.
    - In `Caddyfile`, change the first line to:
@@ -121,13 +129,17 @@ is charged all month, running or not, so it is kept small (us-east-1 on-demand p
    - Check locally: `docker compose up -d --force-recreate caddy` still serves `http://localhost/`.
    - Commit and push. The instance will `git clone` the repository. If it's private, create a read-only GitHub
      fine-grained token or a deploy key for the instance.
-4. **Create the bucket and upload the index.** Keep the defaults: block all public access, encryption on. Turn
-   on versioning.
+4. **Create the bucket in the console, as admin, then upload the index.**
+   - **One bucket for every artifact,** with a folder per capability and build date:
+     `lexical/<profile>/<build-date>/` now, `graph/` and `semantic/` later. A bucket costs nothing by itself, and
+     one bucket means one name and one set of settings. A new build never overwrites the one being served.
+   - **Settings:** general purpose, the instance's region, public access blocked, ACLs disabled, versioning on,
+     SSE-S3 encryption, tag `project=startorch`. The name cannot be changed later.
+   - **One lifecycle rule,** on all objects: delete incomplete multipart uploads after 7 days, and noncurrent
+     versions after 30 days. A failed upload otherwise leaves invisible parts that are billed forever.
    ```
-   aws s3 mb s3://<bucket> --region <region>
-   aws s3api put-bucket-versioning --bucket <bucket> --versioning-configuration Status=Enabled
-   aws s3 sync /data/scholar_rank/posting/full-en s3://<bucket>/indexes/full-en/2026-09-19/ \
-       --exclude "token_stream/*" --exclude "posting/partial/*"
+   aws s3 sync /data/scholar_rank/posting/full-en s3://<bucket>/lexical/full-en/2026-09-19/ \
+       --exclude "token_stream/*" --exclude "posting/partial/*" --dryrun      # check the list, then drop --dryrun
    ```
    The upload is 56 GB, so its time depends on your upload speed: about 2.5 hours at 50 Mbit/s. If it stops,
    run the same command again; `sync` skips the files already uploaded.
@@ -136,8 +148,7 @@ is charged all month, running or not, so it is kept small (us-east-1 on-demand p
 
 5. **An IAM role for the instance.** IAM → Roles → a role trusted by EC2, with:
    - `AmazonSSMManagedInstanceCore`, for shell access through Session Manager;
-   - read access to the index prefix only: `s3:ListBucket` on the bucket, and `s3:GetObject` on
-     `arn:aws:s3:::<bucket>/indexes/*`.
+   - read-only access to the bucket: `s3:ListBucket` on it, and `s3:GetObject` on `arn:aws:s3:::<bucket>/*`.
 
    The instance then gets short-lived credentials from its role, with no keys stored on it.
 6. **A security group.** Inbound: TCP 80 and TCP 443 from anywhere, plus UDP 443 for HTTP/3. Nothing else: no port
@@ -150,6 +161,7 @@ is charged all month, running or not, so it is kept small (us-east-1 on-demand p
    - Storage: a 20 GB gp3 root volume (OS, Docker, images, build cache), plus a 64 GB gp3 data volume for the
      53 GiB index. With a separate volume, the index survives replacing the instance.
    - The IAM role and security group from steps 5 and 6. No key pair.
+   - Tag: `project=startorch`. The `startorch-cli` policy can start and stop only instances with this tag.
 8. **Allocate an Elastic IP,** and associate it with the instance.
 9. **Point the name at it.** In Porkbun → Domain Management → DNS, add an `A` record: host `startorch`, answer the
    Elastic IP, TTL 600. The specific record overrides the parking wildcard. Check it from your machine:
@@ -175,7 +187,7 @@ Session Manager plugin, then `aws ssm start-session --target <instance-id>`.
     ```
 12. **Download the index** into the layout that `project-config.toml` expects under `INDEX_ROOT`:
     ```
-    sudo aws s3 sync s3://<bucket>/indexes/full-en/2026-09-19/ /srv/index/posting/full-en/
+    sudo aws s3 sync s3://<bucket>/lexical/full-en/2026-09-19/ /srv/index/posting/full-en/
     ```
 13. **Make Docker wait for the index.** `restart: unless-stopped` already brings the stack back after a reboot,
     since Docker starts at boot. But without this, Docker could start before the volume is mounted, and the app
@@ -321,7 +333,7 @@ docker run -p 8000:8000 -e STARTORCH_PROFILE=full-en -v /data/scholar_rank:/data
 
 - Upload only the serving files, to a versioned prefix:
   ```
-  aws s3 sync /data/scholar_rank/posting/full-en s3://<bucket>/indexes/full-en/2026-09-19/ \
+  aws s3 sync /data/scholar_rank/posting/full-en s3://<bucket>/lexical/full-en/2026-09-19/ \
       --exclude "token_stream/*" --exclude "posting/partial/*"
   ```
 - On the instance, `aws s3 sync` it down into `<volume>/posting/full-en/` on a gp3 volume. Keep that layout:
