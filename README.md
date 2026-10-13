@@ -6,6 +6,8 @@ It currently targets the OpenAlex English-only Works corpus: 345M+ papers. The r
 
 The long-term goal is to support sub-second top-k retrieval over the full corpus while using the citation graph as an additional ranking signal, all while keeping RAM usage manageable for a personal device.
 
+The service is deployed on [`startorch.halzyonnn.dev`](https://startorch.halzyonnn.dev) (Though the instance only activate on a demo-only basis due to budget constraints).
+
 ## Why this project?
 
 Startorch is an experiment aimed to answer the question whether a combination of:
@@ -20,7 +22,7 @@ Admittedly, applications of PageRank in citation graph is not a novel concepts, 
 
 ## Status
 
-As of September 29, 2026:
+As of October 12, 2026:
 
 ### Data pipeline : Done
 
@@ -55,9 +57,11 @@ On the full English corpus, the loaded engine holds 6.7 GiB in memory, and needs
 
 See [`docs/bmw_technical_report.md`](docs/bmw_technical_report.md).
 
-### Live service: In progress
+### Live service: Done
 
-Containerization is all set up. The whole site runs locally in Docker on the full English corpus. What is left is to upload the index to AWS, run it on a single EC2 instance, and test it there.
+The service is deployed. It runs on a single AWS EC2 instance at [`startorch.halzyonnn.dev`](https://startorch.halzyonnn.dev), on the full English corpus, with HTTPS.
+
+It is a demo only. The full corpus needs a machine with 16 GB of RAM, and running one all month would drain too much cash (about $95). So the instance is started only for demos, and stopped the rest of the time. The site does not answer while it is stopped. The whole setup costs about $30 a month this way.
 
 It currently supports:
 
@@ -71,14 +75,15 @@ The query engine and tokenizer are thread-safe, and the engine releases the GIL 
 
 Results carry OpenAlex IDs only; the client fetches titles from the OpenAlex API.
 
-The container setup consists of:
+The deployment consists of:
 
 - a two-stage Docker image, which builds the C++ engine and ships a slim Python runtime
 - Docker Compose, running the API behind Caddy, which serves the page and proxies `/api`
 - the index kept outside the image, mounted read-only
-- one `.env` file per machine, for the index profile and location
-
-The service will run at `startorch.halzyonnn.dev`, with HTTPS from Caddy. It is a demo, so the instance runs only when needed, to keep costs around $30 a month.
+- one `.env` file per machine, for the index profile, its location, and the site address
+- the index stored in S3, and downloaded once to the instance
+- HTTPS certificates that Caddy gets and renews by itself
+- an alarm that stops the instance if it is left running
 
 See [`docs/deployment.md`](docs/deployment.md).
 
@@ -118,11 +123,11 @@ Original plan was to combine lexical, graph, and embedding-based retrieval, but 
 
 The future plan for this project is:
 
-1. Deploy the query engine as a live service on EC2 and S3.
-2. Begin the graph representation and Global PageRank implementation.
-3. Figure out to aggregate rankings from each metrics.
-4. More research and reading for query-specific authority rankings.
-5. Reduce query-engine memory, so the full corpus fits on a smaller machine.
+1. Begin the graph representation and Global PageRank implementation.
+2. Figure out to aggregate rankings from each metrics.
+3. More research and reading for query-specific authority rankings.
+4. Reduce query-engine memory, so the full corpus fits on a smaller and cheaper machine.
+5. Keep the search page reachable while the instance is stopped.
 
 ## Progress
 
@@ -143,7 +148,7 @@ The future plan for this project is:
 - [x] HTTP API layer
 - [x] search page
 - [x] Docker image and Compose setup
-- [ ] EC2 + S3 deployment
+- [x] EC2 + S3 deployment (demo only)
 - [ ] CSR/CSC citation-graph representation
 - [ ] Global PageRank
 - [ ] approximate Personalized PageRank
@@ -187,7 +192,7 @@ startorch/
 │   ├── retrieval_engine.md             BM25 + Block-Max WAND implementation
 │   ├── bmw_technical_report.md         Comprehensive BMW implementation technical report + benchmarks.
 │   ├── data_pipeline.md                OpenAlex ingestion pipeline
-│   ├── deployment.md                   EC2 + S3 deployment plan
+│   ├── deployment.md                   EC2 + S3 deployment
 │   └── data_reference.md               OpenAlex field reference
 │
 ├── project-config.toml                 ✅ shared paths and subset configuration
